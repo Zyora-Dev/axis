@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axis-ml"
-version = "0.4.0"
+version = "0.4.1"
 description = "Axis — a reliable framework for training and fine-tuning transformers, by Zyora Labs"
 readme = "README.md"
 requires-python = ">=3.10"

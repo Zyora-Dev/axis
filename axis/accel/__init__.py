@@ -66,7 +66,7 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
         return None
     try:
         import locomp as lc
-        from axis.accel.matmul_naive import bmm
+        from axis.accel.matmul_naive import nmm
 
         # Normalize to [B, M, K] @ [B, K, N] via numpy broadcasting rules.
         a3 = a.reshape((-1, a.shape[-2], a.shape[-1])) if a.ndim > 2 else a[None]
@@ -79,9 +79,6 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
         B, M, K = a3.shape
         N = b3.shape[2]
 
-        ta = lc.tensor(np.ascontiguousarray(a3))
-        tb = lc.tensor(np.ascontiguousarray(b3))
-        to = lc.empty((B, M, N))
         if M >= 16 and N >= 16 and K >= 16:
             from axis.accel.tiled import TILE, tiled_matmul
             # Pad M/N/K to a multiple of TILE (the tiled kernel assumes it).
@@ -106,8 +103,16 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
                 tiled_matmul[grid, tg](tta, ttb, ttc, Mp, Np, Kp, nt, TILE)
                 res[bi] = ttc.numpy().reshape(Mp, Np)[:M, :N]
         else:
-            bmm[(B, M, N)](ta, tb, to, M=M, K=K, N=N)
-            res = to.numpy()
+            # Small shapes: 2D-grid naive kernel, host loops the batch (a 3D
+            # grid does not port to locomp's CUDA codegen).
+            res = np.empty((B, M, N), dtype=np.float32)
+            grid = (N, M)  # (cols, rows)
+            for bi in range(B):
+                tta = lc.tensor(np.ascontiguousarray(a3[bi]).flatten())
+                ttb = lc.tensor(np.ascontiguousarray(b3[bi]).flatten())
+                ttc = lc.empty(M * N)
+                nmm[grid](tta, ttb, ttc, M=M, K=K, N=N)
+                res[bi] = ttc.numpy().reshape(M, N)
         out = res.reshape((*a.shape[:-1], N) if a.ndim > 2 else (M, N))
         return out.astype(np.float32)
     except Exception:  # noqa: BLE001 — fall back to NumPy on any kernel issue

@@ -72,12 +72,26 @@ The suite gradchecks **every op**, verifies determinism (bit-identical runs),
 round-trips checkpoints, and proves end-to-end correctness by training a small
 transformer until it memorizes a copy task (loss < 0.1).
 
+## GPU acceleration (Phase 2)
+
+```python
+import axis
+axis.accel.enable()   # locomp GPU dispatch: Metal / CUDA / ROCm / RISC-V
+```
+
+Heavy ops (matmul — forward *and* backward — softmax, SiLU, GELU) execute as
+[locomp](https://github.com/Zyora-Dev/locomp) kernels when enabled, with
+automatic NumPy fallback per-op. Parity is enforced by tests: every GPU result
+must match the NumPy reference, including a full transformer training run
+converging with GPU kernels in the loop (verified on Apple M1 Metal).
+
 ## Roadmap
 
-- **Phase 1 (this):** NumPy reference engine — full autograd, transformer
+- **Phase 1 (done):** NumPy reference engine — full autograd, transformer
   blocks, AdamW, checkpoints. The ground truth.
-- **Phase 2:** locomp GPU backend (Metal / CUDA / ROCm / RISC-V) validated
-  against Phase 1 outputs.
+- **Phase 2 (done):** locomp GPU kernels (Metal / CUDA / ROCm / RISC-V) for
+  matmul/softmax/activations, parity-tested against Phase 1. Next: on-device
+  residency + fused attention kernels.
 - **Phase 3:** LoRA/QLoRA fine-tuning, bf16 mixed precision, gradient
   checkpointing, HF weight import.
 - **Phase 4:** multi-GPU data parallel.

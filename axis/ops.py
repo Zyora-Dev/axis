@@ -15,6 +15,13 @@ from typing import Optional, Sequence
 import numpy as np
 
 from axis.tensor import Tensor, is_grad_enabled
+from axis import accel
+
+
+def _mm(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Matmul that tries the GPU (locomp) and falls back to NumPy."""
+    out = accel.matmul(a, b)
+    return out if out is not None else a @ b
 
 
 def _make(data: np.ndarray, parents: Sequence[Tensor], op: str, backward) -> Tensor:
@@ -158,7 +165,8 @@ def gelu(a: Tensor) -> Tensor:
     x = a.data
     inner = c * (x + k * x**3)
     t = np.tanh(inner)
-    data = 0.5 * x * (1.0 + t)
+    gpu = accel.gelu(x)
+    data = gpu if gpu is not None else 0.5 * x * (1.0 + t)
     def backward(g):
         # d/dx [0.5x(1+t)] = 0.5(1+t) + 0.5x * (1-t^2) * c(1+3k x^2)
         dt = (1.0 - t * t) * c * (1.0 + 3.0 * k * x * x)
@@ -169,7 +177,8 @@ def gelu(a: Tensor) -> Tensor:
 def silu(a: Tensor) -> Tensor:
     """SiLU / swish: x * sigmoid(x). Used by SwiGLU (Llama-family MLPs)."""
     sig = 1.0 / (1.0 + np.exp(-a.data))
-    data = a.data * sig
+    gpu = accel.silu(a.data)
+    data = gpu if gpu is not None else a.data * sig
     def backward(g):
         return [(a, g * (sig * (1.0 + a.data * (1.0 - sig))))]
     return _make(data, (a,), "silu", backward)
@@ -179,14 +188,15 @@ def silu(a: Tensor) -> Tensor:
 
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
-    """Batched matmul with full broadcast support (numpy semantics)."""
-    data = a.data @ b.data
+    """Batched matmul with full broadcast support (numpy semantics).
+    Forward AND backward matmuls route through the GPU when enabled."""
+    data = _mm(a.data, b.data)
     def backward(g):
         # dA = g @ B^T ; dB = A^T @ g  (with batch-dim reduction)
         b_t = np.swapaxes(b.data, -1, -2)
         a_t = np.swapaxes(a.data, -1, -2)
-        ga = g @ b_t
-        gb = a_t @ g
+        ga = _mm(g, np.ascontiguousarray(b_t))
+        gb = _mm(np.ascontiguousarray(a_t), g)
         return [(a, _unbroadcast(ga, a.shape)), (b, _unbroadcast(gb, b.shape))]
     return _make(data, (a, b), "matmul", backward)
 
@@ -266,9 +276,16 @@ def cat(tensors: Sequence[Tensor], axis: int = 0) -> Tensor:
 
 
 def softmax(a: Tensor, axis: int = -1) -> Tensor:
-    shifted = a.data - a.data.max(axis=axis, keepdims=True)  # stability
-    e = np.exp(shifted)
-    data = e / e.sum(axis=axis, keepdims=True)
+    if axis in (-1, a.data.ndim - 1):
+        gpu = accel.softmax_lastdim(a.data)
+    else:
+        gpu = None
+    if gpu is not None:
+        data = gpu
+    else:
+        shifted = a.data - a.data.max(axis=axis, keepdims=True)  # stability
+        e = np.exp(shifted)
+        data = e / e.sum(axis=axis, keepdims=True)
     def backward(g):
         # dx = s * (g - sum(g * s))
         dot = (g * data).sum(axis=axis, keepdims=True)

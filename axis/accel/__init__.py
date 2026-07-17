@@ -135,3 +135,54 @@ def gelu(x: np.ndarray) -> np.ndarray | None:
         return to.numpy().reshape(x.shape).astype(np.float32)
     except Exception:  # noqa: BLE001
         return None
+
+
+def silu_mul(g: np.ndarray, u: np.ndarray) -> np.ndarray | None:
+    """Fused silu(g) * u — the SwiGLU inner product, one round trip."""
+    if not _ENABLED or g.dtype != np.float32 or g.shape != u.shape:
+        return None
+    try:
+        import locomp as lc
+        from axis.accel.kernels import silu_mul_kernel
+
+        gf = np.ascontiguousarray(g.reshape(-1))
+        uf = np.ascontiguousarray(u.reshape(-1))
+        tg = lc.tensor(gf)
+        tu = lc.tensor(uf)
+        to = lc.empty(gf.shape)
+        silu_mul_kernel[(gf.size,)](tg, tu, to)
+        return to.numpy().reshape(g.shape).astype(np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def fused_causal_attention(
+    q: np.ndarray, k: np.ndarray, v: np.ndarray, scale: float
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fused causal attention forward.
+
+    q, k, v: [B, H, T, D] float32. Returns (out [B,H,T,D], probs [B,H,T,T])
+    in ONE kernel launch — versus 3 GPU round trips + CPU softmax composed.
+    Probs are returned because the exact backward needs them.
+    """
+    if not _ENABLED or q.dtype != np.float32:
+        return None
+    if q.shape != k.shape or q.shape != v.shape or q.ndim != 4:
+        return None
+    try:
+        import locomp as lc
+        from axis.accel.kernels import fused_attn_kernel
+
+        B, H, T, D = q.shape
+        BH = B * H
+        tq = lc.tensor(np.ascontiguousarray(q.reshape(BH, T, D)))
+        tk = lc.tensor(np.ascontiguousarray(k.reshape(BH, T, D)))
+        tv = lc.tensor(np.ascontiguousarray(v.reshape(BH, T, D)))
+        to = lc.empty((BH, T, D))
+        tp = lc.empty((BH, T, T))
+        fused_attn_kernel[(BH, T)](tq, tk, tv, to, tp, T=T, D=D, SCALE=float(scale))
+        out = to.numpy().reshape(B, H, T, D).astype(np.float32)
+        probs = tp.numpy().reshape(B, H, T, T).astype(np.float32)
+        return out, probs
+    except Exception:  # noqa: BLE001
+        return None

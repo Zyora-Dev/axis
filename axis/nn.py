@@ -258,15 +258,9 @@ class CausalSelfAttention(Module):
             k = ops.cat([k] * rep, axis=1)
             v = ops.cat([v] * rep, axis=1)
 
-        att = ops.matmul(q, ops.transpose(k, -2, -1))  # [B, H, T, T]
-        att = ops.mul(att, Tensor(np.float32(1.0 / math.sqrt(self.head_dim))))
-
-        # Causal mask: -inf above the diagonal (applied as additive mask).
-        mask = np.triu(np.full((T, T), -1e9, dtype=np.float32), k=1)
-        att = ops.add(att, Tensor(mask[None, None]))
-        att = ops.softmax(att, axis=-1)
-
-        out = ops.matmul(att, v)  # [B, H, T, D]
+        # Fused: scores + causal mask + stable softmax + weighted sum in one
+        # op (single GPU kernel when acceleration is enabled).
+        out = ops.fused_causal_attention(q, k, v, 1.0 / math.sqrt(self.head_dim))
         out = ops.reshape(ops.transpose(out, 1, 2), (B, T, self.n_heads * self.head_dim))
         return self.o_proj(out)
 
@@ -281,7 +275,8 @@ class SwiGLU(Module):
         self.down_proj = Linear(hidden, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(ops.mul(ops.silu(self.gate_proj(x)), self.up_proj(x)))
+        # Fused silu(gate) * up — one tape node, one GPU round trip.
+        return self.down_proj(ops.silu_mul(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(Module):

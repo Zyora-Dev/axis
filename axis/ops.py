@@ -346,3 +346,58 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
         return [(logits, (g * p).reshape(logits.shape).astype(np.float32))]
 
     return _make(data, (logits,), "cross_entropy", backward)
+
+
+# ─── fused ops (Phase 2.5 — one tape node, one GPU round trip) ─────────────
+
+
+def silu_mul(g: Tensor, u: Tensor) -> Tensor:
+    """Fused silu(g) * u — the SwiGLU inner product."""
+    sig = 1.0 / (1.0 + np.exp(-g.data))
+    gpu = accel.silu_mul(g.data, u.data)
+    data = gpu if gpu is not None else (g.data * sig) * u.data
+    def backward(grad):
+        silu_g = g.data * sig
+        d_silu = sig * (1.0 + g.data * (1.0 - sig))
+        return [
+            (g, grad * u.data * d_silu),
+            (u, grad * silu_g),
+        ]
+    return _make(data, (g, u), "silu_mul", backward)
+
+
+def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
+    """Causal attention in one op: softmax(mask(q@k^T * scale)) @ v.
+
+    q, k, v: [B, H, T, D]. One kernel launch on GPU (scores + mask + stable
+    softmax + weighted sum fused); NumPy fallback computes the identical math.
+    One tape node instead of five — backward is the standard attention
+    backward over the saved probabilities, with its matmuls routed through the
+    GPU too.
+    """
+    B, H, T, D = q.shape
+    fused = accel.fused_causal_attention(q.data, k.data, v.data, scale)
+    if fused is not None:
+        data, probs = fused
+    else:
+        scores = _mm(q.data, np.ascontiguousarray(np.swapaxes(k.data, -1, -2))) * scale
+        mask = np.triu(np.full((T, T), -1e30, dtype=np.float32), k=1)
+        scores = scores + mask[None, None]
+        shifted = scores - scores.max(axis=-1, keepdims=True)
+        e = np.exp(shifted)
+        probs = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)
+        data = _mm(probs, v.data)
+
+    def backward(grad):
+        # dV = P^T @ dO
+        p_t = np.ascontiguousarray(np.swapaxes(probs, -1, -2))
+        dv = _mm(p_t, grad)
+        # dP = dO @ V^T ; softmax backward: dS = P * (dP - sum(dP*P))
+        dp = _mm(grad, np.ascontiguousarray(np.swapaxes(v.data, -1, -2)))
+        ds = probs * (dp - (dp * probs).sum(axis=-1, keepdims=True))
+        # dQ = dS @ K * scale ; dK = dS^T @ Q * scale
+        dq = _mm(ds, k.data) * scale
+        dk = _mm(np.ascontiguousarray(np.swapaxes(ds, -1, -2)), q.data) * scale
+        return [(q, dq.astype(np.float32)), (k, dk.astype(np.float32)), (v, dv.astype(np.float32))]
+
+    return _make(data, (q, k, v), "fused_causal_attention", backward)

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axis-ml"
+version = "0.1.0"
+description = "Axis — a reliable framework for training and fine-tuning transformers, by Zyora Labs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Zyora Labs" }]
+keywords = [
+  "deep-learning", "transformers", "training", "fine-tuning",
+  "autograd", "llm", "machine-learning",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/Zyora-Dev/axis"
+
+[tool.setuptools.packages.find]
+include = ["axis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

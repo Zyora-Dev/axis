@@ -115,41 +115,51 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
         from axis.accel.matmul_naive import nmm
         be = _BACKEND
 
-        # Normalize to [B, M, K] @ [B, K, N] via numpy broadcasting rules.
-        a3 = a.reshape((-1, a.shape[-2], a.shape[-1])) if a.ndim > 2 else a[None]
+        # Normalize to [B, M, K] @ [B, K, N]. When b is a shared 2D matrix
+        # (the common Linear-layer case) collapse ALL of a's leading dims into
+        # one big M: a single 2D matmul, weight uploaded once — no per-batch
+        # broadcast/re-upload.
+        N = b.shape[-1]
+        out_shape = (*a.shape[:-1], N)
         if b.ndim == 2:
-            b3 = np.broadcast_to(b, (a3.shape[0], *b.shape))
+            K = a.shape[-1]
+            if b.shape[0] != K:
+                return None
+            a3 = a.reshape(1, -1, K)
+            b3 = b.reshape(1, K, N)
         else:
+            a3 = a.reshape((-1, a.shape[-2], a.shape[-1]))
             b3 = b.reshape((-1, b.shape[-2], b.shape[-1]))
-        if a3.shape[0] != b3.shape[0] or a3.shape[2] != b3.shape[1]:
-            return None
+            if a3.shape[0] != b3.shape[0] or a3.shape[2] != b3.shape[1]:
+                return None
         B, M, K = a3.shape
         N = b3.shape[2]
 
         if M >= 16 and N >= 16 and K >= 16:
-            from axis.accel.tiled import TILE, tiled_matmul
-            launch = _launcher(tiled_matmul.func, be)
+            from axis.accel.batched_tiled import TILE, tiled_matmul_b
+            launch = _launcher(tiled_matmul_b.func, be)
             # Pad M/N/K to a multiple of TILE (the tiled kernel assumes it).
             Mp = (M + TILE - 1) // TILE * TILE
             Np = (N + TILE - 1) // TILE * TILE
             Kp = (K + TILE - 1) // TILE * TILE
             nt = Kp // TILE
-            grid = (Np // TILE, Mp // TILE)
+            mtiles = Mp // TILE
             tg = (TILE, TILE)
-            res = np.empty((B, M, N), dtype=np.float32)
-            for bi in range(B):  # host batch loop over the proven 2D kernel
-                ap = a3[bi]
-                bp = b3[bi]
-                if (Mp, Np, Kp) != (M, N, K):
-                    apad = np.zeros((Mp, Kp), dtype=np.float32); apad[:M, :K] = ap
-                    bpad = np.zeros((Kp, Np), dtype=np.float32); bpad[:K, :N] = bp
-                    ap, bp = apad, bpad
-                # Flattened 1D tensors + positional args (matches locomp example 07).
-                tta = lc.tensor(ap.flatten(), backend=be)
-                ttb = lc.tensor(bp.flatten(), backend=be)
-                ttc = lc.empty(Mp * Np, backend=be)
-                launch[grid, tg](tta, ttb, ttc, Mp, Np, Kp, nt, TILE)
-                res[bi] = ttc.numpy().reshape(Mp, Np)[:M, :N]
+            # Pad + upload the WHOLE batch once, one launch, one download.
+            if (Mp, Kp) != (M, K):
+                apad = np.zeros((B, Mp, Kp), dtype=np.float32); apad[:, :M, :K] = a3
+            else:
+                apad = np.ascontiguousarray(a3)
+            if (Kp, Np) != (K, N):
+                bpad = np.zeros((B, Kp, Np), dtype=np.float32); bpad[:, :K, :N] = b3
+            else:
+                bpad = np.ascontiguousarray(b3)
+            tta = lc.tensor(apad.reshape(-1), backend=be)
+            ttb = lc.tensor(bpad.reshape(-1), backend=be)
+            ttc = lc.empty(B * Mp * Np, backend=be)
+            grid = (Np // TILE, B * mtiles)   # batch folded into grid dim 1
+            launch[grid, tg](tta, ttb, ttc, Mp, Np, Kp, nt, TILE, mtiles)
+            res = ttc.numpy().reshape(B, Mp, Np)[:, :M, :N]
         else:
             # Small shapes: 2D-grid naive kernel, host loops the batch (a 3D
             # grid does not port to locomp's CUDA codegen).
@@ -162,8 +172,7 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
                 ttc = lc.empty(M * N, backend=be)
                 launch[grid](tta, ttb, ttc, M=M, K=K, N=N)
                 res[bi] = ttc.numpy().reshape(M, N)
-        out = res.reshape((*a.shape[:-1], N) if a.ndim > 2 else (M, N))
-        return out.astype(np.float32)
+        return res.reshape(out_shape).astype(np.float32)
     except Exception:  # noqa: BLE001 — fall back to NumPy on any kernel issue
         return None
 

@@ -58,14 +58,15 @@ def is_enabled() -> bool:
 
 def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
     """Batched matmul via locomp. Returns None if shapes unsupported (caller
-    falls back to NumPy)."""
+    falls back to NumPy). Uses the shared-memory tiled kernel for larger
+    shapes, the naive kernel for tiny ones."""
     if not _ENABLED:
         return None
     if a.ndim < 2 or b.ndim < 2 or a.dtype != np.float32 or b.dtype != np.float32:
         return None
     try:
         import locomp as lc
-        from axis.accel.kernels import bmm_kernel
+        from axis.accel.matmul_naive import bmm
 
         # Normalize to [B, M, K] @ [B, K, N] via numpy broadcasting rules.
         a3 = a.reshape((-1, a.shape[-2], a.shape[-1])) if a.ndim > 2 else a[None]
@@ -81,8 +82,33 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
         ta = lc.tensor(np.ascontiguousarray(a3))
         tb = lc.tensor(np.ascontiguousarray(b3))
         to = lc.empty((B, M, N))
-        bmm_kernel[(B, M, N)](ta, tb, to, M=M, K=K, N=N)
-        out = to.numpy().reshape((*a.shape[:-1], N) if a.ndim > 2 else (M, N))
+        if M >= 16 and N >= 16 and K >= 16:
+            from axis.accel.tiled import TILE, tiled_matmul
+            # Pad M/N/K to a multiple of TILE (the tiled kernel assumes it).
+            Mp = (M + TILE - 1) // TILE * TILE
+            Np = (N + TILE - 1) // TILE * TILE
+            Kp = (K + TILE - 1) // TILE * TILE
+            nt = Kp // TILE
+            grid = (Np // TILE, Mp // TILE)
+            tg = (TILE, TILE)
+            res = np.empty((B, M, N), dtype=np.float32)
+            for bi in range(B):  # host batch loop over the proven 2D kernel
+                ap = a3[bi]
+                bp = b3[bi]
+                if (Mp, Np, Kp) != (M, N, K):
+                    apad = np.zeros((Mp, Kp), dtype=np.float32); apad[:M, :K] = ap
+                    bpad = np.zeros((Kp, Np), dtype=np.float32); bpad[:K, :N] = bp
+                    ap, bp = apad, bpad
+                # Flattened 1D tensors + positional args (matches locomp example 07).
+                tta = lc.tensor(ap.flatten())
+                ttb = lc.tensor(bp.flatten())
+                ttc = lc.empty(Mp * Np)
+                tiled_matmul[grid, tg](tta, ttb, ttc, Mp, Np, Kp, nt, TILE)
+                res[bi] = ttc.numpy().reshape(Mp, Np)[:M, :N]
+        else:
+            bmm[(B, M, N)](ta, tb, to, M=M, K=K, N=N)
+            res = to.numpy()
+        out = res.reshape((*a.shape[:-1], N) if a.ndim > 2 else (M, N))
         return out.astype(np.float32)
     except Exception:  # noqa: BLE001 — fall back to NumPy on any kernel issue
         return None
@@ -93,13 +119,13 @@ def softmax_lastdim(x: np.ndarray) -> np.ndarray | None:
         return None
     try:
         import locomp as lc
-        from axis.accel.kernels import softmax_rows_kernel
+        from axis.accel.softmax import softmax_rows
 
         d = x.shape[-1]
         rows = x.reshape(-1, d)
         tx = lc.tensor(np.ascontiguousarray(rows))
         to = lc.empty(rows.shape)
-        softmax_rows_kernel[(rows.shape[0],)](tx, to, D=d)
+        softmax_rows[(rows.shape[0],)](tx, to, D=d)
         return to.numpy().reshape(x.shape).astype(np.float32)
     except Exception:  # noqa: BLE001
         return None
@@ -171,7 +197,7 @@ def fused_causal_attention(
         return None
     try:
         import locomp as lc
-        from axis.accel.kernels import fused_attn_kernel
+        from axis.accel.attention import fused_attn
 
         B, H, T, D = q.shape
         BH = B * H
@@ -180,7 +206,7 @@ def fused_causal_attention(
         tv = lc.tensor(np.ascontiguousarray(v.reshape(BH, T, D)))
         to = lc.empty((BH, T, D))
         tp = lc.empty((BH, T, T))
-        fused_attn_kernel[(BH, T)](tq, tk, tv, to, tp, T=T, D=D, SCALE=float(scale))
+        fused_attn[(BH, T)](tq, tk, tv, to, tp, T=T, D=D, SCALE=float(scale))
         out = to.numpy().reshape(B, H, T, D).astype(np.float32)
         probs = tp.numpy().reshape(B, H, T, T).astype(np.float32)
         return out, probs

@@ -90,8 +90,12 @@ converging with GPU kernels in the loop (verified on Apple M1 Metal).
 - **Phase 1 (done):** NumPy reference engine — full autograd, transformer
   blocks, AdamW, checkpoints. The ground truth.
 - **Phase 2 (done):** locomp GPU kernels (Metal / CUDA / ROCm / RISC-V) for
-  matmul/softmax/activations, parity-tested against Phase 1. Next: on-device
-  residency + fused attention kernels.
+  matmul/softmax/activations, parity-tested against Phase 1.
+- **Phase 2.5 (done):** fused causal-attention + SwiGLU ops (one kernel each);
+  **shared-memory tiled matmul** (16×16 tiles). Each locomp kernel that uses
+  constexpr dims for indexing lives in its own module (`tiled.py`,
+  `matmul_naive.py`, `attention.py`, `softmax.py`) to avoid a cross-kernel
+  constexpr type leak in the compiler.
 - **Phase 3:** LoRA/QLoRA fine-tuning, bf16 mixed precision, gradient
   checkpointing, HF weight import.
 - **Phase 4:** multi-GPU data parallel.

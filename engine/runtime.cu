@@ -23,7 +23,7 @@ enum OpKind {
     OP_ROPE = 10, OP_SOFTMAX_CAUSAL = 11, OP_REPEAT_KV = 12, OP_RMSNORM_BWD = 13,
     OP_COLSUM = 14, OP_REPEAT_KV_BWD = 15, OP_SOFTMAX_BWD = 16, OP_SILU_BWD = 17,
     OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
-    OP_FLASH = 23,
+    OP_FLASH = 23, OP_ROWDOT = 24, OP_FLASH_BWD = 25,
 };
 
 typedef struct {
@@ -520,6 +520,227 @@ static size_t flash_smem(int BR, int BC, int DH) {
          + (size_t)(BR * (DH + 8) + 2 * BC * (DH + 8) + BR * (BC + 8)) * 2;
 }
 
+// ── fused flash attention backward ─────────────────────────────────────
+// D[r] = rowsum(dO[r] * O[r]) — one warp per row. bf16 in, fp32 out.
+template <typename T>
+__global__ void k_rowdot(const T* a, const T* b, float* c, long long rows, int dim) {
+    long long r = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const int lane = threadIdx.x & 31;
+    float acc = 0.f;
+    for (int d = lane; d < dim; d += 32)
+        acc += ldf(a, r * dim + d) * ldf(b, r * dim + d);
+    for (int off = 16; off; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    if (!lane) c[r] = acc;
+}
+
+// One block per (b*h, K-TILE of BC rows) — FA2 layout. K/V load once; inner
+// loop over causal q-tiles. Probs recomputed ON-CHIP from LSE (no max pass):
+// P = exp(S*scale - lse); dS = P*(dP - D)*scale. dK/dV accumulate in
+// PERSISTENT wmma register fragments across the whole q-loop (each warp owns
+// fixed tiles), one atomicAdd flush at the end — atomics also perform the GQA
+// group-sum across the rep q-heads sharing a kv head. dQ atomicAdds per
+// q-tile (fp32). dq/dk/dv are fp32 (cast to bf16 by a following CAST op).
+template <int BR, int BC>
+__global__ void k_flash_bwd(const bf16* __restrict__ q, const bf16* __restrict__ k,
+                            const bf16* __restrict__ v, const bf16* __restrict__ dO,
+                            const float* __restrict__ lse, const float* __restrict__ Dd,
+                            float* dq, float* dk, float* dv,
+                            int T, int DH, int H, int KV, float scale) {
+    const int kb = blockIdx.x * BC;
+    if (kb >= T) return;
+    const int bh = blockIdx.y;
+    const int b = bh / H, h = bh % H;
+    const int g = h / (H / KV);
+    const long long qoff = (long long)bh * T * DH;
+    const long long koff = ((long long)b * KV + g) * T * DH;
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    const int warp = tid >> 5, nwarp = nthr >> 5, lane = tid & 31;
+
+    const int QLD = DH + 8, PLD = BC + 8;
+    const int SLD = ((BC > DH) ? BC : DH) + 4;   // fp32 staging stride (union)
+    extern __shared__ char smem[];
+    float* Sfp  = (float*)smem;                  // BR*SLD: S -> dP -> dq/dk/dv staging
+    float* lse_s = Sfp + BR * SLD;               // BR
+    float* D_s  = lse_s + BR;                    // BR
+    bf16* Ks  = (bf16*)(D_s + BR);               // BC*QLD (resident)
+    bf16* Vs  = Ks + BC * QLD;                   // BC*QLD (resident)
+    bf16* Qs  = Vs + BC * QLD;                   // BR*QLD
+    bf16* dOs = Qs + BR * QLD;                   // BR*QLD
+    bf16* Pb  = dOs + BR * QLD;                  // BR*PLD
+    bf16* dSb = Pb + BR * PLD;                   // BR*PLD
+
+    const bf16 zb = __float2bfloat16(0.f);
+    const int V8 = DH / 8, Q8 = QLD / 8;
+    const uint4 z4 = make_uint4(0, 0, 0, 0);
+    {
+        const uint4* k4 = (const uint4*)(k + koff);
+        const uint4* v4 = (const uint4*)(v + koff);
+        uint4* Ks4 = (uint4*)Ks; uint4* Vs4 = (uint4*)Vs;
+        for (int i = tid; i < BC * V8; i += nthr) {
+            int r = i / V8, j = i % V8;
+            bool in = kb + r < T;
+            long long src = (long long)(kb + r) * V8 + j;
+            Ks4[r * Q8 + j] = in ? k4[src] : z4;
+            Vs4[r * Q8 + j] = in ? v4[src] : z4;
+        }
+    }
+    const int RT = BR / 16, CT = BC / 16, DT_ = DH / 16;
+    const int NKV = CT * DT_;                    // dk/dv output tiles
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> dvA[2], dkA[2];
+    nvcuda::wmma::fill_fragment(dvA[0], 0.f); nvcuda::wmma::fill_fragment(dvA[1], 0.f);
+    nvcuda::wmma::fill_fragment(dkA[0], 0.f); nvcuda::wmma::fill_fragment(dkA[1], 0.f);
+    __syncthreads();
+
+    for (int qb = (kb / BR) * BR; qb < T; qb += BR) {
+        {
+            const uint4* q4 = (const uint4*)(q + qoff);
+            const uint4* o4 = (const uint4*)(dO + qoff);
+            uint4* Qs4 = (uint4*)Qs; uint4* dOs4 = (uint4*)dOs;
+            for (int i = tid; i < BR * V8; i += nthr) {
+                int r = i / V8, j = i % V8;
+                bool in = qb + r < T;
+                long long src = (long long)(qb + r) * V8 + j;
+                Qs4[r * Q8 + j] = in ? q4[src] : z4;
+                dOs4[r * Q8 + j] = in ? o4[src] : z4;
+            }
+            for (int r = tid; r < BR; r += nthr) {
+                bool in = qb + r < T;
+                lse_s[r] = in ? lse[(long long)bh * T + qb + r] : 0.f;
+                D_s[r] = in ? Dd[((long long)b * T + qb + r) * H + h] : 0.f;
+            }
+        }
+        __syncthreads();
+        // S = Q @ K^T
+        for (int t = warp; t < RT * CT; t += nwarp) {
+            const int r0 = (t / CT) * 16, c0 = (t % CT) * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+            nvcuda::wmma::fill_fragment(acc, 0.f);
+            for (int kk = 0; kk < DH; kk += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::row_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::col_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, Qs + r0 * QLD + kk, QLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Ks + c0 * QLD + kk, QLD);
+                nvcuda::wmma::mma_sync(acc, af, bfr, acc);
+            }
+            nvcuda::wmma::store_matrix_sync(Sfp + r0 * SLD + c0, acc, SLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        // P = exp(S*scale - lse), causal mask
+        for (int r = warp; r < BR; r += nwarp) {
+            const int qg = qb + r;
+            if (qg >= T) {
+                for (int c = lane; c < BC; c += 32) Pb[r * PLD + c] = zb;
+                continue;
+            }
+            const float l = lse_s[r];
+            for (int c = lane; c < BC; c += 32) {
+                float p = (kb + c <= qg) ? __expf(Sfp[r * SLD + c] * scale - l) : 0.f;
+                Pb[r * PLD + c] = __float2bfloat16(p);
+            }
+        }
+        __syncthreads();
+        // dV += P^T @ dO (persistent fragments; k-dim = BR)
+        for (int t = warp; t < NKV; t += nwarp) {
+            const int s = (t - warp) / nwarp;
+            const int j0 = (t / DT_) * 16, d0 = (t % DT_) * 16;
+            for (int q0 = 0; q0 < BR; q0 += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::col_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::row_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, Pb + q0 * PLD + j0, PLD);
+                nvcuda::wmma::load_matrix_sync(bfr, dOs + q0 * QLD + d0, QLD);
+                nvcuda::wmma::mma_sync(dvA[s], af, bfr, dvA[s]);
+            }
+        }
+        // dP = dO @ V^T -> Sfp (S consumed)
+        for (int t = warp; t < RT * CT; t += nwarp) {
+            const int r0 = (t / CT) * 16, c0 = (t % CT) * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+            nvcuda::wmma::fill_fragment(acc, 0.f);
+            for (int dd = 0; dd < DH; dd += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::row_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::col_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, dOs + r0 * QLD + dd, QLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Vs + c0 * QLD + dd, QLD);
+                nvcuda::wmma::mma_sync(acc, af, bfr, acc);
+            }
+            nvcuda::wmma::store_matrix_sync(Sfp + r0 * SLD + c0, acc, SLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        // dS = P * (dP - D) * scale
+        for (int r = warp; r < BR; r += nwarp) {
+            const int qg = qb + r;
+            if (qg >= T) {
+                for (int c = lane; c < BC; c += 32) dSb[r * PLD + c] = zb;
+                continue;
+            }
+            const float dr = D_s[r];
+            for (int c = lane; c < BC; c += 32) {
+                float p = __bfloat162float(Pb[r * PLD + c]);
+                dSb[r * PLD + c] = __float2bfloat16(p * (Sfp[r * SLD + c] - dr) * scale);
+            }
+        }
+        __syncthreads();
+        // dK += dS^T @ Q (persistent fragments)
+        for (int t = warp; t < NKV; t += nwarp) {
+            const int s = (t - warp) / nwarp;
+            const int j0 = (t / DT_) * 16, d0 = (t % DT_) * 16;
+            for (int q0 = 0; q0 < BR; q0 += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::col_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::row_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, dSb + q0 * PLD + j0, PLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Qs + q0 * QLD + d0, QLD);
+                nvcuda::wmma::mma_sync(dkA[s], af, bfr, dkA[s]);
+            }
+        }
+        // dq_partial = dS @ K -> Sfp staging -> atomicAdd
+        for (int t = warp; t < RT * DT_; t += nwarp) {
+            const int r0 = (t / DT_) * 16, d0 = (t % DT_) * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+            nvcuda::wmma::fill_fragment(acc, 0.f);
+            for (int c0 = 0; c0 < BC; c0 += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::row_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::row_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, dSb + r0 * PLD + c0, PLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Ks + c0 * QLD + d0, QLD);
+                nvcuda::wmma::mma_sync(acc, af, bfr, acc);
+            }
+            nvcuda::wmma::store_matrix_sync(Sfp + r0 * SLD + d0, acc, SLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int i = tid; i < BR * DH; i += nthr) {
+            int r = i / DH, d = i % DH;
+            if (qb + r < T)
+                atomicAdd(&dq[qoff + (long long)(qb + r) * DH + d], Sfp[r * SLD + d]);
+        }
+        __syncthreads();
+    }
+    // flush dV then dK fragments (staging via Sfp)
+    for (int pass = 0; pass < 2; pass++) {
+        for (int t = warp; t < NKV; t += nwarp) {
+            const int s = (t - warp) / nwarp;
+            const int j0 = (t / DT_) * 16, d0 = (t % DT_) * 16;
+            nvcuda::wmma::store_matrix_sync(Sfp + j0 * SLD + d0, pass ? dkA[s] : dvA[s],
+                                            SLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        float* dst = pass ? dk : dv;
+        for (int i = tid; i < BC * DH; i += nthr) {
+            int j = i / DH, d = i % DH;
+            if (kb + j < T)
+                atomicAdd(&dst[koff + (long long)(kb + j) * DH + d], Sfp[j * SLD + d]);
+        }
+        __syncthreads();
+    }
+}
+
+static size_t flash_bwd_smem(int BR, int BC, int DH) {
+    int sld = ((BC > DH) ? BC : DH) + 4;
+    return (size_t)(BR * sld + 2 * BR) * 4
+         + (size_t)(2 * BC * (DH + 8) + 2 * BR * (DH + 8) + 2 * BR * (BC + 8)) * 2;
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 API int eng_init() {
     if (cublasCreate(&g_blas)) return 1;
@@ -530,7 +751,10 @@ API int eng_init() {
     if (cublasSetStream(g_blas, g_stream)) return 6;    // flash kernels use >48KB dynamic shared memory — opt in here (NOT inside
     // graph capture)
     cudaFuncSetAttribute(k_flash_fwd<64, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
-    cudaFuncSetAttribute(k_flash_fwd<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);    for (int i = 0; i < MAX_BUFS; i++) g_bufs[i] = nullptr;
+    cudaFuncSetAttribute(k_flash_fwd<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
+    cudaFuncSetAttribute(k_flash_bwd<64, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
+    cudaFuncSetAttribute(k_flash_bwd<32, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
+    for (int i = 0; i < MAX_BUFS; i++) g_bufs[i] = nullptr;
     return 0;
 }
 
@@ -741,6 +965,37 @@ static int exec_op(const EngOp* op) {
             int blocks = (int)((n + T - 1) / T);
             if (op->tb == 0) k_cast_f2b<<<blocks, T, 0, g_stream>>>(CEL(float)(A), EL(bf16)(C), n);
             else             k_cast_b2f<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), EL(float)(C), n);
+            break;
+        }
+        case OP_ROWDOT: {
+            // c[r] = sum_d a[r,d]*b[r,d]; m=rows n=dim; bf16 in (dt>=1), fp32 out
+            long long rows = op->m;
+            int blocks = (int)((rows * 32 + 255) / 256);
+            if (op->dt >= 1) k_rowdot<<<blocks, 256, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(float)(C), rows, op->n);
+            else             k_rowdot<<<blocks, 256, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), rows, op->n);
+            break;
+        }
+        case OP_FLASH_BWD: {
+            // a=q b=k d=v c=dO; sa=lse sb=D tb=dqf sc=dkf oa=dvf ob=H;
+            // m=T n=DH k=KV batch=B; alpha=scale. dq/dk/dv fp32 (pre-zeroed).
+            if (op->dt != 1 || op->n % 16 || op->n > 128) return 102;
+            int T_ = op->m, DH_ = op->n, Hh = op->ob;
+            float* dqf = EL(float)(g_bufs[op->tb]);
+            float* dkf = EL(float)(g_bufs[op->sc]);
+            float* dvf = EL(float)(g_bufs[op->oa]);
+            const float* lseb = CEL(float)(g_bufs[op->sa]);
+            const float* Db = CEL(float)(g_bufs[op->sb]);
+            if (DH_ <= 64) {
+                dim3 grid((T_ + 63) / 64, op->batch * Hh);
+                k_flash_bwd<64, 64><<<grid, 256, flash_bwd_smem(64, 64, DH_), g_stream>>>(
+                    CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), CEL(bf16)(C), lseb, Db,
+                    dqf, dkf, dvf, T_, DH_, Hh, op->k, op->alpha);
+            } else {
+                dim3 grid((T_ + 31) / 32, op->batch * Hh);
+                k_flash_bwd<32, 32><<<grid, 256, flash_bwd_smem(32, 32, DH_), g_stream>>>(
+                    CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), CEL(bf16)(C), lseb, Db,
+                    dqf, dkf, dvf, T_, DH_, Hh, op->k, op->alpha);
+            }
             break;
         }
         default: return 100;

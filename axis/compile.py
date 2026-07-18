@@ -20,7 +20,7 @@ from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL,
                          RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
                          SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST,
-                         FLASH)
+                         FLASH, ROWDOT, FLASH_BWD)
 
 
 class CompiledTransformer:
@@ -136,6 +136,8 @@ class CompiledTransformer:
         gs = [A(N * MLP, isz) for _ in range(L)]
         us = [A(N * MLP, isz) for _ in range(L)]
         hs = [A(N * MLP, isz) for _ in range(L)]
+        # flash: per-block LSE (fp32) saved by fwd for the fused backward
+        lses = [A(BH * T) for _ in range(L)] if use_flash else []
 
         # ── shared scratch ──
         q0 = A(N * H * DH, isz); k0 = A(N * KV * DH, isz); v0 = A(N * KV * DH, isz)
@@ -158,6 +160,11 @@ class CompiledTransformer:
         dq0 = A(N * H * DH, isz); dk0 = A(N * KV * DH, isz); dv0 = A(N * KV * DH, isz)
         dy1 = A(N * D, isz); dy2 = A(N * D, isz); dy3 = A(N * D, isz); dy = A(N * D, isz)
         dx1 = A(N * D, isz); dxin = A(N * D, isz)
+        if use_flash:
+            # fused-bwd scratch: D rowdot + fp32 grad targets (atomics need
+            # fp32; CAST back to the bf16 dq2/dk2/dv1 afterwards)
+            bD = A(N * H)
+            dqf = A(N * H * DH); dkf = A(N * KV * DH); dvf = A(N * KV * DH)
 
         G = self.gbuf
         eps_n = eps
@@ -179,9 +186,11 @@ class CompiledTransformer:
             ]
             if use_flash:
                 # fused kernel: scores+softmax+pv in ONE launch, probs stay
-                # on-chip (online softmax), GQA + causal handled in-kernel
+                # on-chip (online softmax), GQA + causal handled in-kernel;
+                # LSE saved for the fused backward
                 plan += [op(FLASH, a=q2s[i], b=k2s[i], d=v1s[i], c=at,
-                            m=T, n=DH, k=KV, batch=B, tb=H, dt=DT, alpha=scale)]
+                            m=T, n=DH, k=KV, batch=B, tb=H, sa=lses[i],
+                            dt=DT, alpha=scale)]
             else:
                 # streaming GQA attention: batch over kv groups; per group-head
                 # j and query tile, only the causal key range
@@ -255,40 +264,59 @@ class CompiledTransformer:
                 op(GEMM_SB, a=dr1, b=P[p + "attn.o_proj.weight"], c=dat2, m=N, k=D, n=H * DH, batch=1, tb=1, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=dr1, c=G[p + "attn.o_proj.weight"], m=H * DH, n=D, k=N, batch=1, tb=2, dt=DTW),
                 op(PERM_0213, a=dat2, c=dat, m=B, n=T, k=H, batch=DH, dt=DT),
-                # dk/dv accumulate over group heads + query tiles (beta=1)
-                op(SCALE, a=dk2, c=dk2, n=N * KV * DH, dt=DT, alpha=0.0),
-                op(SCALE, a=dv1, c=dv1, n=N * KV * DH, dt=DT, alpha=0.0),
             ]
-            # streaming GQA attention backward: recompute probs per tile;
-            # the beta=1 GEMMs also perform the GQA group-sum for dk/dv
-            for j in range(rep):
-                for qs, qt in tiles:
-                    kl = qs + qt
-                    plan += [
-                        op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
-                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
-                           oa=(j * T + qs) * DH, dt=DT, alpha=scale),
-                        op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
-                           k=qs, dt=DT),
-                        # dprobs = dat_tile @ v^T
-                        op(GEMM_SB, a=dat, b=v1s[i], c=b_dprt, m=qt, k=DH, n=kl,
-                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
-                           oa=(j * T + qs) * DH, dt=DT),
-                        # dv[:kl] += probs^T @ dat_tile
-                        op(GEMM_SB, a=b_prt, b=dat, c=dv1, m=kl, n=DH, k=qt,
-                           batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
-                           ob=(j * T + qs) * DH, dt=DT, beta=1.0),
-                        op(SOFTMAX_BWD, a=b_prt, b=b_dprt, c=b_dsct, batch=BKV,
-                           m=qt, n=kl, dt=DT),
-                        # dq_tile = dscores @ k[:kl] * scale
-                        op(GEMM_SB, a=b_dsct, b=k2s[i], c=dq2, m=qt, k=kl, n=DH,
-                           batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
-                           oc=(j * T + qs) * DH, dt=DT, alpha=scale),
-                        # dk[:kl] += dscores^T @ q_tile * scale
-                        op(GEMM_SB, a=b_dsct, b=q2s[i], c=dk2, m=kl, n=DH, k=qt,
-                           batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
-                           ob=(j * T + qs) * DH, dt=DT, alpha=scale, beta=1.0),
-                    ]
+            if use_flash:
+                plan += [
+                    # D = rowsum(dO * O): both pre-perm [B,T,H,DH] -> rows B*T*H
+                    op(ROWDOT, a=dat2, b=at2s[i], c=bD, m=N * H, n=DH, dt=DT),
+                    # fp32 grad targets (atomics accumulate; GQA group-sum
+                    # happens inside the kernel's dk/dv atomicAdds)
+                    op(SCALE, a=dqf, c=dqf, n=N * H * DH, alpha=0.0),
+                    op(SCALE, a=dkf, c=dkf, n=N * KV * DH, alpha=0.0),
+                    op(SCALE, a=dvf, c=dvf, n=N * KV * DH, alpha=0.0),
+                    op(FLASH_BWD, a=q2s[i], b=k2s[i], d=v1s[i], c=dat,
+                       sa=lses[i], sb=bD, tb=dqf, sc=dkf, oa=dvf, ob=H,
+                       m=T, n=DH, k=KV, batch=B, dt=DT, alpha=scale),
+                    op(CAST, a=dqf, c=dq2, m=N * H * DH, tb=0),
+                    op(CAST, a=dkf, c=dk2, m=N * KV * DH, tb=0),
+                    op(CAST, a=dvf, c=dv1, m=N * KV * DH, tb=0),
+                ]
+            else:
+                plan += [
+                    # dk/dv accumulate over group heads + query tiles (beta=1)
+                    op(SCALE, a=dk2, c=dk2, n=N * KV * DH, dt=DT, alpha=0.0),
+                    op(SCALE, a=dv1, c=dv1, n=N * KV * DH, dt=DT, alpha=0.0),
+                ]
+                # streaming GQA attention backward: recompute probs per tile;
+                # the beta=1 GEMMs also perform the GQA group-sum for dk/dv
+                for j in range(rep):
+                    for qs, qt in tiles:
+                        kl = qs + qt
+                        plan += [
+                            op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
+                               batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                               oa=(j * T + qs) * DH, dt=DT, alpha=scale),
+                            op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
+                               k=qs, dt=DT),
+                            # dprobs = dat_tile @ v^T
+                            op(GEMM_SB, a=dat, b=v1s[i], c=b_dprt, m=qt, k=DH, n=kl,
+                               batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                               oa=(j * T + qs) * DH, dt=DT),
+                            # dv[:kl] += probs^T @ dat_tile
+                            op(GEMM_SB, a=b_prt, b=dat, c=dv1, m=kl, n=DH, k=qt,
+                               batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
+                               ob=(j * T + qs) * DH, dt=DT, beta=1.0),
+                            op(SOFTMAX_BWD, a=b_prt, b=b_dprt, c=b_dsct, batch=BKV,
+                               m=qt, n=kl, dt=DT),
+                            # dq_tile = dscores @ k[:kl] * scale
+                            op(GEMM_SB, a=b_dsct, b=k2s[i], c=dq2, m=qt, k=kl, n=DH,
+                               batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
+                               oc=(j * T + qs) * DH, dt=DT, alpha=scale),
+                            # dk[:kl] += dscores^T @ q_tile * scale
+                            op(GEMM_SB, a=b_dsct, b=q2s[i], c=dk2, m=kl, n=DH, k=qt,
+                               batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
+                               ob=(j * T + qs) * DH, dt=DT, alpha=scale, beta=1.0),
+                        ]
             plan += [
                 op(ROPE, a=dq2, b=b_cos, d=b_sin, c=dq1, batch=BH, m=T, n=DH, tb=1, dt=DT),
                 op(ROPE, a=dk2, b=b_cos, d=b_sin, c=dk1, batch=BKV, m=T, n=DH, tb=1, dt=DT),

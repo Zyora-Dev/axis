@@ -24,6 +24,21 @@ _ENABLED = False
 _AVAILABLE: bool | None = None
 _BACKEND: str | None = None       # "cuda" | "rocm" | "metal"
 _LAUNCHERS: dict = {}             # (func_id, backend) -> KernelLauncher
+_TENSOR_CORES = False             # CUDA wmma fp16 path — OFF by default.
+# Validated on A100: the wmma kernel is correct (train loss matches fp32 to
+# 1e-4) and fast on its own (~0.15ms vs ~1.5ms scalar for 512^3). BUT end to
+# end it's SLOWER, because per-op CPU<->GPU transfer is ~10x the kernel time
+# and fp16 casting adds host work on top. Tensor cores only pay off once
+# tensors stay resident on the GPU across ops (device residency). Kept here,
+# opt-in via use_tensor_cores(True), as groundwork for that.
+
+
+def use_tensor_cores(flag: bool) -> None:
+    """Toggle the CUDA tensor-core (fp16) matmul fast path. Off by default:
+    at present the per-op host round-trip dominates, so fp16 casting is a net
+    loss end-to-end. Becomes a win with device residency."""
+    global _TENSOR_CORES
+    _TENSOR_CORES = bool(flag)
 
 
 def detect_backend() -> str | None:
@@ -102,6 +117,30 @@ def is_enabled() -> bool:
 # Phase 2.5 optimization once parity is proven.
 
 
+def _mm_wmma(a3, b3, B, M, N, K, be):
+    """CUDA tensor-core batched matmul. Pads M/N/K to 16, casts inputs to
+    fp16, accumulates in fp32, one launch for the whole batch. Returns
+    [B, M, N] float32, or None on any failure (caller falls back to scalar)."""
+    try:
+        import locomp as lc
+        from axis.accel.wmma import WMMA, wmma_matmul_b
+
+        Mp = (M + WMMA - 1) // WMMA * WMMA
+        Np = (N + WMMA - 1) // WMMA * WMMA
+        Kp = (K + WMMA - 1) // WMMA * WMMA
+        mtiles = Mp // WMMA
+        ap = np.zeros((B, Mp, Kp), dtype=np.float16); ap[:, :M, :K] = a3.astype(np.float16)
+        bp = np.zeros((B, Kp, Np), dtype=np.float16); bp[:, :K, :N] = b3.astype(np.float16)
+        tta = lc.tensor(ap.reshape(-1), backend=be)     # fp16 in
+        ttb = lc.tensor(bp.reshape(-1), backend=be)
+        ttc = lc.empty(B * Mp * Np, backend=be)          # fp32 accumulate/out
+        grid = (Np // WMMA, B * mtiles)                  # batch folded into grid dim 1
+        _launcher(wmma_matmul_b.func, be)[grid, (32,)](tta, ttb, ttc, Mp, Np, Kp, mtiles)
+        return ttc.numpy().reshape(B, Mp, Np)[:, :M, :N].astype(np.float32)
+    except Exception:  # noqa: BLE001 — fall back to the scalar tiled kernel
+        return None
+
+
 def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
     """Batched matmul via locomp. Returns None if shapes unsupported (caller
     falls back to NumPy). Uses the shared-memory tiled kernel for larger
@@ -134,6 +173,13 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
                 return None
         B, M, K = a3.shape
         N = b3.shape[2]
+
+        # CUDA tensor-core (wmma) fast path: fp16 inputs, fp32 accumulate.
+        # Matches cuBLAS's hardware; kept as our own portable-ish kernel.
+        if be == "cuda" and _TENSOR_CORES:
+            r = _mm_wmma(a3, b3, B, M, N, K, be)
+            if r is not None:
+                return r.reshape(out_shape).astype(np.float32)
 
         if M >= 16 and N >= 16 and K >= 16:
             from axis.accel.batched_tiled import TILE, tiled_matmul_b

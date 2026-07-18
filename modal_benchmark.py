@@ -79,6 +79,7 @@ def benchmark():
 
     # ---- Axis training throughput ----
     del hf; torch.cuda.empty_cache()
+    cp.get_default_memory_pool().free_all_blocks()
     opt_a = optim.AdamW(am.parameters(), lr=3e-4)
     ai = axis.Tensor(inp_np); at = axis.Tensor(tgt_np)
     for i in range(STEPS + 2):
@@ -87,7 +88,13 @@ def benchmark():
         l = am.loss(ai, at); l.backward(); opt_a.step(); opt_a.zero_grad()
     cp.cuda.Stream.null.synchronize()
     axis_ms = (time.perf_counter() - t0) / STEPS * 1000
+    # True in-use peak: after a forward, every activation is live (that's the
+    # peak); backward then frees them incrementally.
+    cp.get_default_memory_pool().free_all_blocks()
+    l = am.loss(ai, at)
+    cp.cuda.Stream.null.synchronize()
     axis_mem = cp.get_default_memory_pool().used_bytes() / 1e9
+    l.backward(); opt_a.step(); opt_a.zero_grad()
 
     print("\n" + "=" * 60, flush=True)
     print(f"FAIR BENCHMARK — Llama {n_params/1e6:.0f}M, batch {BATCH} seq {SEQ}, fp32+TF32", flush=True)

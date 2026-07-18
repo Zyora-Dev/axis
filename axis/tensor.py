@@ -141,8 +141,16 @@ class Tensor:
         return self.shape[0]
 
     # ── autograd core ──
-    def backward(self, grad: Optional[np.ndarray] = None) -> None:
-        """Reverse-mode autodiff from this tensor through the tape."""
+    def backward(self, grad: Optional[np.ndarray] = None,
+                 retain_graph: bool = False) -> None:
+        """Reverse-mode autodiff from this tensor through the tape.
+
+        With `retain_graph=False` (the default, matching PyTorch) each node's
+        saved activation and backward closure are released as soon as its
+        gradient has been propagated — this bounds peak memory during backward
+        instead of holding the whole graph alive. Pass `retain_graph=True` to
+        keep the graph for a second backward pass.
+        """
         if not self.requires_grad and self._backward is None:
             raise RuntimeError("backward() on a tensor that does not require grad")
         if grad is None:
@@ -191,10 +199,17 @@ class Tensor:
                         grads[key] = grads[key] + pg
                     else:
                         grads[key] = pg
-                    # Intermediate tensors that require grad AND are leaves of
-                    # a subgraph (e.g. checkpointing) also accumulate.
-                    if parent.requires_grad and not parent._parents:
-                        pass  # handled when popped above
+                # Free this node's saved graph state now that its backward has
+                # run: the activation is no longer needed (all downstream
+                # consumers were processed earlier in reverse topo, and this
+                # node's own backward just used it). Leaves (params/inputs) and
+                # the root tensor are preserved.
+                if not retain_graph:
+                    node._backward = None
+                    if node._parents and node is not self:
+                        node.data = None      # release the activation array
+                        node._dev = None      # and any cached device buffer
+                    node._parents = ()
 
     def zero_grad(self) -> None:
         self.grad = None

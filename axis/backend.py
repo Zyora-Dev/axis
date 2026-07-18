@@ -11,7 +11,14 @@ When CuPy isn't installed, everything stays on NumPy.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as _np
+
+# Enable TF32 tensor cores for cuBLAS/cuDNN on Ampere+ (what PyTorch does by
+# default). Same fp32 dtype and range, ~fp32 accuracy, faster matmul. Must be
+# set before cupy imports. Opt out with AXIS_TF32=0.
+os.environ["CUPY_TF32"] = os.environ.get("AXIS_TF32", "1")
 
 try:
     import cupy as _cp

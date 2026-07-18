@@ -17,7 +17,7 @@ import numpy as np
 (GEMM, ADD, MUL, SILU_MUL, RMSNORM, ADAMW, SCALE, COPY,
  GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
  RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD, SILU_BWD,
- EMBED, EMBED_BWD, CE, TICK) = range(22)
+ EMBED, EMBED_BWD, CE, TICK, CAST) = range(23)
 
 
 class _EngOp(ctypes.Structure):
@@ -28,6 +28,7 @@ class _EngOp(ctypes.Structure):
         ("m", ctypes.c_int), ("n", ctypes.c_int), ("k", ctypes.c_int),
         ("batch", ctypes.c_int), ("tb", ctypes.c_int),
         ("sa", ctypes.c_int), ("sb", ctypes.c_int), ("sc", ctypes.c_int),
+        ("dt", ctypes.c_int),
         ("alpha", ctypes.c_float), ("beta", ctypes.c_float), ("gamma", ctypes.c_float),
     ]
 
@@ -35,20 +36,23 @@ class _EngOp(ctypes.Structure):
 def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
        m: int = 0, n: int = 0, k: int = 0,
        batch: int = 0, tb: int = 0, sa: int = 0, sb: int = 0, sc: int = 0,
-       alpha: float = 0.0, beta: float = 0.0, gamma: float = 0.0) -> Tuple:
-    """Op descriptor. Notable role maps:
+       dt: int = 0, alpha: float = 0.0, beta: float = 0.0, gamma: float = 0.0) -> Tuple:
+    """Op descriptor. dt: 0=fp32, 1=bf16 storage, 2=bf16 inputs/fp32 output.
+    Notable role maps:
     GEMM_SB:  tb=0: c=a@b; tb=1: c=a@b^T (b=[n,k]); tb=2: c=a[k,m]^T@b[k,n]
     PERM_0213: dims (m,n,k,batch) = (d0,d1,d2,d3), out [d0,d2,d1,d3]
-    ROPE:     a=[batch*m rows, n]; b=cos, d=sin; tb=1 -> inverse (backward)
+    ROPE:     a=[batch*m rows, n]; b=cos, d=sin (fp32); tb=1 -> inverse
     SOFTMAX_CAUSAL/BWD: rows batch*m, width m; a(,b)->c
     REPEAT_KV(_BWD): batch=B, tb=KV, n=H, m=T, k=dh
     RMSNORM_BWD: a=x b=w d=g -> c=dx, tb=tmp buffer (colsum -> dw)
     SILU_BWD: a=g b=u d=grad -> c=dg, tb=du buffer
-    EMBED(_BWD): a=table|g, b=ids(float) -> c; m=N n=D
-    CE: a=logits b=targets -> c=dlogits d=loss[1]; m=N n=V
-    ADAMW: a=p b=g c=m d=v; alpha=lr*sqrt(bc2)/bc1, beta=lr*wd, gamma=eps*sqrt(bc2)
+    EMBED(_BWD): a=table|g, b=ids(fp32) -> c; m=N n=D (BWD: dt>=1 means g bf16)
+    CE: a=logits b=targets -> c=dlogits d=loss(fp32); m=N n=V
+    ADAMW: a=master(fp32) b=g(fp32) c=m d=v; tb=t-buffer (-1 folded);
+           sa=bf16 param mirror (0 = none); alpha=lr beta=lr*wd gamma=eps
+    CAST: a->c; tb=0 fp32->bf16, tb=1 bf16->fp32; m(*n)=count
     """
-    return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, alpha, beta, gamma)
+    return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, alpha, beta, gamma)
 
 
 class Engine:
@@ -57,7 +61,7 @@ class Engine:
     def __init__(self, lib_path: str = "libaxeng.so"):
         self.lib = ctypes.CDLL(lib_path)
         self.lib.eng_init.restype = ctypes.c_int
-        self.lib.eng_alloc.argtypes = [ctypes.c_int, ctypes.c_longlong]
+        self.lib.eng_alloc.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_int]
         self.lib.eng_upload.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float),
                                         ctypes.c_longlong]
         self.lib.eng_download.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float),
@@ -71,12 +75,12 @@ class Engine:
         self._next = 0
 
     # ── buffers ──
-    def alloc(self, nfloats: int) -> int:
+    def alloc(self, nelems: int, itemsize: int = 4) -> int:
         idx = self._next
         self._next += 1
-        rc = self.lib.eng_alloc(idx, nfloats)
+        rc = self.lib.eng_alloc(idx, nelems, itemsize)
         if rc:
-            raise RuntimeError(f"alloc({nfloats}) failed rc={rc}")
+            raise RuntimeError(f"alloc({nelems}x{itemsize}) failed rc={rc}")
         return idx
 
     def upload(self, idx: int, arr: np.ndarray) -> None:
@@ -101,7 +105,7 @@ class Engine:
     def _pack(self, plan: Sequence[Tuple]):
         arr = (_EngOp * len(plan))()
         for i, o in enumerate(plan):
-            arr[i] = _EngOp(*[int(x) if j < 13 else float(x) for j, x in enumerate(o)])
+            arr[i] = _EngOp(*[int(x) if j < 14 else float(x) for j, x in enumerate(o)])
         return arr
 
     def zero(self, idx: int, nfloats: int) -> Tuple:

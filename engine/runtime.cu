@@ -1,112 +1,105 @@
-// Axis engine runtime — Phase 1 skeleton.
+// Axis engine runtime — C ABI, own cuBLAS handle, execution plans, CUDA graphs.
 //
-// A minimal, dependency-free C/CUDA runtime that executes a whole training
-// step as an EXECUTION PLAN (array of op descriptors over a buffer table),
-// with our own cuBLAS handle + workspace so the entire plan can be captured
-// into a CUDA graph and replayed with zero Python involvement.
-//
-// Exposed as a plain C ABI for ctypes (no pybind, dependency-light).
+// Dtype support: fp32 and bf16 storage. All math accumulates in fp32; bf16 is
+// storage/tensor-core format (same exponent range as fp32 -> no loss scaling).
+// Per-op `dt` flag: 0 = fp32; 1 = bf16 in/out; 2 = bf16 inputs, fp32 output
+// (weight-grad GEMMs, colsum). Buffer table holds raw pointers; ops interpret.
 //
 // Build: nvcc -O3 -arch=sm_80 --shared -Xcompiler -fPIC runtime.cu -lcublas -o libaxeng.so
 #include <cstdio>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #define API extern "C" __attribute__((visibility("default")))
-#define MAX_BUFS 4096
+#define MAX_BUFS 8192
+typedef __nv_bfloat16 bf16;
 
 // ── op kinds ────────────────────────────────────────────────────────────────
 enum OpKind {
-    OP_GEMM = 0,       // c[m,n] = a[m,k] @ b[k,n]      (row-major)
-    OP_ADD = 1,        // c = a + b                      (n elements)
-    OP_MUL = 2,        // c = a * b
-    OP_SILU_MUL = 3,   // c = silu(a) * b
-    OP_RMSNORM = 4,    // c = a / sqrt(mean(a^2,-1)+eps) * b   (m rows, n cols)
-    OP_ADAMW = 5,      // fused AdamW: p,m,v updated from g (n elements)
-    OP_SCALE = 6,      // c = a * alpha
-    OP_COPY = 7,       // c = a
-    OP_GEMM_SB = 8,    // strided-batched: tb=0 NN, tb=1 NT (a@b^T, b=[n,k]), tb=2 TN (a[k,m]^T@b[k,n])
-    OP_PERM_0213 = 9,  // [d0,d1,d2,d3] -> [d0,d2,d1,d3]  (dims m,n,k,batch = d0..d3)
-    OP_ROPE = 10,      // half-split rotary on [rows, dh]; cos=b, sin=d, T=m, dh=n; tb=1 inverse
-    OP_SOFTMAX_CAUSAL = 11, // rows = batch*T, row r masks cols > r%T; width n=T
-    OP_REPEAT_KV = 12, // [B,KV,T,dh] -> [B,H,T,dh], grouped (h -> h/rep)
-    OP_RMSNORM_BWD = 13, // a=x b=w d=g -> c=dx, tb=tmp buf (g*x*inv for dw colsum)
-    OP_COLSUM = 14,    // c[n] = sum_rows a[m,n]
-    OP_REPEAT_KV_BWD = 15, // group-sum: [B,H,T,dh] -> [B,KV,T,dh]
-    OP_SOFTMAX_BWD = 16,   // a=p b=dp -> c = p*(dp - rowsum(dp*p)); rows=batch*m, width m
-    OP_SILU_BWD = 17,  // a=g b=u d=grad -> c=dg, tb=du buffer
-    OP_EMBED = 18,     // a=table[V,D] b=ids(float)[N] -> c=out[N,D]; m=N n=D
-    OP_EMBED_BWD = 19, // a=g[N,D] b=ids -> atomicAdd into c=dTable; m=N n=D
-    OP_CE = 20,        // a=logits[N,V] b=targets(float)[N] -> c=dlogits, d=loss(1); m=N n=V
-    OP_TICK = 21,      // a: t-buffer (1 float) += 1
+    OP_GEMM = 0, OP_ADD = 1, OP_MUL = 2, OP_SILU_MUL = 3, OP_RMSNORM = 4,
+    OP_ADAMW = 5, OP_SCALE = 6, OP_COPY = 7, OP_GEMM_SB = 8, OP_PERM_0213 = 9,
+    OP_ROPE = 10, OP_SOFTMAX_CAUSAL = 11, OP_REPEAT_KV = 12, OP_RMSNORM_BWD = 13,
+    OP_COLSUM = 14, OP_REPEAT_KV_BWD = 15, OP_SOFTMAX_BWD = 16, OP_SILU_BWD = 17,
+    OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
 };
 
 typedef struct {
     int   kind;
-    int   a, b, c, d;   // buffer indices (op-specific roles)
-    int   m, n, k;      // dims
-    int   batch, tb;    // batch count, transpose flag / aux buffer
-    int   sa, sb, sc;   // per-batch strides (elements)
-    float alpha, beta, gamma;  // scalars (eps, lr, scale, ...)
+    int   a, b, c, d;
+    int   m, n, k;
+    int   batch, tb;
+    int   sa, sb, sc;
+    int   dt;                    // 0 fp32 | 1 bf16 | 2 bf16-in fp32-out
+    float alpha, beta, gamma;
 } EngOp;
 
 // ── global state ────────────────────────────────────────────────────────────
 static cublasHandle_t g_blas = nullptr;
 static cudaStream_t   g_stream = nullptr;
 static void*          g_ws = nullptr;
-static float*         g_bufs[MAX_BUFS];
+static void*          g_bufs[MAX_BUFS];
 static cudaGraphExec_t g_graph_exec = nullptr;
 
-// ── kernels ─────────────────────────────────────────────────────────────────
-__global__ void k_add(const float* a, const float* b, float* c, int n) {
+// ── load/store helpers (fp32 math, T storage) ───────────────────────────────
+__device__ __forceinline__ float ldf(const float* p, long long i) { return p[i]; }
+__device__ __forceinline__ float ldf(const bf16* p, long long i) { return __bfloat162float(p[i]); }
+__device__ __forceinline__ void stf(float* p, long long i, float v) { p[i] = v; }
+__device__ __forceinline__ void stf(bf16* p, long long i, float v) { p[i] = __float2bfloat16(v); }
+
+// ── kernels (templated on storage type) ─────────────────────────────────────
+template <typename T>
+__global__ void k_add(const T* a, const T* b, T* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] + b[i];
+    if (i < n) stf(c, i, ldf(a, i) + ldf(b, i));
 }
-__global__ void k_mul(const float* a, const float* b, float* c, int n) {
+template <typename T>
+__global__ void k_mul(const T* a, const T* b, T* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] * b[i];
+    if (i < n) stf(c, i, ldf(a, i) * ldf(b, i));
 }
-__global__ void k_silu_mul(const float* a, const float* b, float* c, int n) {
+template <typename T>
+__global__ void k_silu_mul(const T* a, const T* b, T* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { float x = a[i]; c[i] = (x / (1.f + expf(-x))) * b[i]; }
+    if (i < n) {
+        float x = ldf(a, i);
+        stf(c, i, (x / (1.f + expf(-x))) * ldf(b, i));
+    }
 }
-__global__ void k_scale(const float* a, float* c, float alpha, int n) {
+template <typename T>
+__global__ void k_scale(const T* a, T* c, float alpha, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i] * alpha;
+    if (i < n) stf(c, i, ldf(a, i) * alpha);
 }
-__global__ void k_copy(const float* a, float* c, int n) {
+template <typename T>
+__global__ void k_copy(const T* a, T* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) c[i] = a[i];
+    if (i < n) stf(c, i, ldf(a, i));
 }
-// One block per row; fp32 accumulation; weight w broadcast over rows.
-__global__ void k_rmsnorm(const float* x, const float* w, float* o,
-                          int rows, int dim, float eps) {
+template <typename T>
+__global__ void k_rmsnorm(const T* x, const T* w, T* o, int rows, int dim, float eps) {
     int r = blockIdx.x;
     if (r >= rows) return;
     extern __shared__ float sh[];
     float acc = 0.f;
     for (int j = threadIdx.x; j < dim; j += blockDim.x) {
-        float v = x[r * dim + j];
+        float v = ldf(x, (long long)r * dim + j);
         acc += v * v;
     }
-    sh[threadIdx.x] = acc;
-    __syncthreads();
+    sh[threadIdx.x] = acc; __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
         __syncthreads();
     }
     float inv = rsqrtf(sh[0] / dim + eps);
     for (int j = threadIdx.x; j < dim; j += blockDim.x)
-        o[r * dim + j] = x[r * dim + j] * inv * w[j];
+        stf(o, (long long)r * dim + j, ldf(x, (long long)r * dim + j) * inv * ldf(w, j));
 }
-// Fused AdamW. Two modes:
-//  tbuf == nullptr: folded constants (alpha=lr*sqrt(bc2)/bc1, beta=lr*wd,
-//                   gamma=eps*sqrt(bc2)) — fixed t.
-//  tbuf != nullptr: t read from device buffer (OP_TICK increments it), bias
-//                   correction computed ON DEVICE — exact under CUDA graphs.
-//                   alpha=lr, beta=lr*wd, gamma=eps.
+// AdamW. tbuf: device step counter (bias correction on device — graph-exact).
+// pbf: optional bf16 param mirror (master p stays fp32; pbf gets the cast).
 __global__ void k_adamw(float* p, const float* g, float* m, float* v,
-                        const float* tbuf, float alpha, float beta, float gamma, int n) {
+                        const float* tbuf, bf16* pbf,
+                        float alpha, float beta, float gamma, int n) {
     const float b1 = 0.9f, b2 = 0.95f;
     __shared__ float s_alpha, s_gamma;
     if (threadIdx.x == 0) {
@@ -116,9 +109,7 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v,
             float bc2 = 1.f - powf(b2, t);
             s_alpha = alpha * sqrtf(bc2) / bc1;
             s_gamma = gamma * sqrtf(bc2);
-        } else {
-            s_alpha = alpha; s_gamma = gamma;
-        }
+        } else { s_alpha = alpha; s_gamma = gamma; }
     }
     __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -127,24 +118,113 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v,
     float mi = b1 * m[i] + (1.f - b1) * gi;
     float vi = b2 * v[i] + (1.f - b2) * gi * gi;
     m[i] = mi; v[i] = vi;
-    float pi = p[i] * (1.f - beta);
-    p[i] = pi - s_alpha * mi / (sqrtf(vi) + s_gamma);
+    float pi = p[i] * (1.f - beta) - s_alpha * mi / (sqrtf(vi) + s_gamma);
+    p[i] = pi;
+    if (pbf) pbf[i] = __float2bfloat16(pi);
 }
-
 __global__ void k_tick(float* t) { if (threadIdx.x == 0 && blockIdx.x == 0) t[0] += 1.f; }
 
-// rmsnorm backward: per row two reductions (ss, gwx); dx out; tmp = g*x*inv for dw.
-__global__ void k_rmsnorm_bwd(const float* x, const float* w, const float* g,
-                              float* dx, float* tmp, int rows, int dim, float eps) {
+template <typename T>
+__global__ void k_perm0213(const T* x, T* o, int d0, int d1, int d2, int d3) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)d0 * d1 * d2 * d3;
+    if (i >= total) return;
+    int j3 = i % d3;
+    long long r = i / d3;
+    int j2 = r % d2; r /= d2;
+    int j1 = r % d1; r /= d1;
+    int j0 = (int)r;
+    o[(((long long)j0 * d2 + j2) * d1 + j1) * d3 + j3] = x[i];
+}
+template <typename T>
+__global__ void k_rope(const T* x, const float* cs, const float* sn,
+                       T* o, int T_, int dh, long long rows) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = rows * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = (int)(r % T_);
+    int half = dh / 2;
+    const T* xr = x + r * dh;
+    if (j < half)
+        stf(o, i, ldf(xr, j) * cs[t * half + j] - ldf(xr, j + half) * sn[t * half + j]);
+    else {
+        int jj = j - half;
+        stf(o, i, ldf(xr, jj) * sn[t * half + jj] + ldf(xr, j) * cs[t * half + jj]);
+    }
+}
+template <typename T>
+__global__ void k_rope_inv(const T* g, const float* cs, const float* sn,
+                           T* o, int T_, int dh, long long rows) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = rows * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = (int)(r % T_);
+    int half = dh / 2;
+    const T* gr = g + r * dh;
+    if (j < half)
+        stf(o, i, ldf(gr, j) * cs[t * half + j] + ldf(gr, j + half) * sn[t * half + j]);
+    else {
+        int jj = j - half;
+        stf(o, i, -ldf(gr, jj) * sn[t * half + jj] + ldf(gr, j) * cs[t * half + jj]);
+    }
+}
+template <typename T>
+__global__ void k_softmax_causal(const T* x, T* o, int T_, long long rows) {
+    long long r = blockIdx.x;
+    if (r >= rows) return;
+    int t = (int)(r % T_);
+    extern __shared__ float sh[];
+    const T* xr = x + r * T_;
+    float mx = -1e30f;
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) mx = fmaxf(mx, ldf(xr, j));
+    sh[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = sh[0]; __syncthreads();
+    float acc = 0.f;
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) acc += expf(ldf(xr, j) - mx);
+    sh[threadIdx.x] = acc; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float denom = sh[0];
+    T* orow = o + r * T_;
+    for (int j = threadIdx.x; j < T_; j += blockDim.x)
+        stf(orow, j, (j <= t) ? expf(ldf(xr, j) - mx) / denom : 0.f);
+}
+template <typename T>
+__global__ void k_repeat_kv(const T* x, T* o, int B, int KV, int H, int T_, int dh) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)B * H * T_ * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = r % T_; r /= T_;
+    int h = r % H; r /= H;
+    int b = (int)r;
+    int rep = H / KV;
+    o[i] = x[(((long long)b * KV + h / rep) * T_ + t) * dh + j];
+}
+// rmsnorm backward: dx (dtype T), tmp (dtype T) for dw colsum.
+template <typename T>
+__global__ void k_rmsnorm_bwd(const T* x, const T* w, const T* g,
+                              T* dx, T* tmp, int rows, int dim, float eps) {
     int r = blockIdx.x;
     if (r >= rows) return;
     extern __shared__ float sh[];
-    const float* xr = x + (long long)r * dim;
-    const float* gr = g + (long long)r * dim;
     float ss = 0.f, gwx = 0.f;
     for (int j = threadIdx.x; j < dim; j += blockDim.x) {
-        ss += xr[j] * xr[j];
-        gwx += gr[j] * w[j] * xr[j];
+        float xv = ldf(x, (long long)r * dim + j);
+        float gv = ldf(g, (long long)r * dim + j);
+        ss += xv * xv;
+        gwx += gv * ldf(w, j) * xv;
     }
     sh[threadIdx.x] = ss; sh[blockDim.x + threadIdx.x] = gwx;
     __syncthreads();
@@ -158,46 +238,45 @@ __global__ void k_rmsnorm_bwd(const float* x, const float* w, const float* g,
     float inv = rsqrtf(sh[0] / dim + eps);
     float coef = inv * inv * inv * (sh[blockDim.x] / dim);
     for (int j = threadIdx.x; j < dim; j += blockDim.x) {
-        float dxj = gr[j] * w[j] * inv - xr[j] * coef;
-        dx[(long long)r * dim + j] = dxj;
-        tmp[(long long)r * dim + j] = gr[j] * xr[j] * inv;
+        long long idx = (long long)r * dim + j;
+        float xv = ldf(x, idx), gv = ldf(g, idx);
+        stf(dx, idx, gv * ldf(w, j) * inv - xv * coef);
+        stf(tmp, idx, gv * xv * inv);
     }
 }
-
-__global__ void k_colsum(const float* a, float* c, int rows, int n) {
+// colsum: T in -> fp32 out (weight grads stay fp32)
+template <typename T>
+__global__ void k_colsum(const T* a, float* c, int rows, int n) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
     float acc = 0.f;
-    for (int r = 0; r < rows; r++) acc += a[(long long)r * n + j];
+    for (int r = 0; r < rows; r++) acc += ldf(a, (long long)r * n + j);
     c[j] = acc;
 }
-
-__global__ void k_repeat_kv_bwd(const float* g, float* o, int B, int KV, int H,
-                                int T, int dh) {
+template <typename T>
+__global__ void k_repeat_kv_bwd(const T* g, T* o, int B, int KV, int H, int T_, int dh) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)B * KV * T * dh;
+    long long total = (long long)B * KV * T_ * dh;
     if (i >= total) return;
     int j = i % dh;
     long long r = i / dh;
-    int t = r % T; r /= T;
+    int t = r % T_; r /= T_;
     int kv = r % KV; r /= KV;
     int b = (int)r;
     int rep = H / KV;
     float acc = 0.f;
     for (int q = 0; q < rep; q++)
-        acc += g[(((long long)b * H + kv * rep + q) * T + t) * dh + j];
-    o[i] = acc;
+        acc += ldf(g, (((long long)b * H + kv * rep + q) * T_ + t) * dh + j);
+    stf(o, i, acc);
 }
-
-__global__ void k_softmax_bwd(const float* p, const float* dp, float* ds,
-                              int width, long long rows) {
+template <typename T>
+__global__ void k_softmax_bwd(const T* p, const T* dp, T* ds, int width, long long rows) {
     long long r = blockIdx.x;
     if (r >= rows) return;
     extern __shared__ float sh[];
-    const float* pr = p + r * width;
-    const float* dpr = dp + r * width;
     float dot = 0.f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) dot += dpr[j] * pr[j];
+    for (int j = threadIdx.x; j < width; j += blockDim.x)
+        dot += ldf(dp, r * width + j) * ldf(p, r * width + j);
     sh[threadIdx.x] = dot; __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
@@ -205,45 +284,45 @@ __global__ void k_softmax_bwd(const float* p, const float* dp, float* ds,
     }
     dot = sh[0];
     for (int j = threadIdx.x; j < width; j += blockDim.x)
-        ds[r * width + j] = pr[j] * (dpr[j] - dot);
+        stf(ds, r * width + j, ldf(p, r * width + j) * (ldf(dp, r * width + j) - dot));
 }
-
-__global__ void k_silu_bwd(const float* g, const float* u, const float* grad,
-                           float* dg, float* du, int n) {
+template <typename T>
+__global__ void k_silu_bwd(const T* g, const T* u, const T* grad,
+                           T* dg, T* du, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float x = g[i];
+    float x = ldf(g, i);
     float sig = 1.f / (1.f + expf(-x));
     float silu = x * sig;
     float dsilu = sig * (1.f + x * (1.f - sig));
-    dg[i] = grad[i] * u[i] * dsilu;
-    du[i] = grad[i] * silu;
+    float gr = ldf(grad, i);
+    stf(dg, i, gr * ldf(u, i) * dsilu);
+    stf(du, i, gr * silu);
 }
-
-__global__ void k_embed(const float* table, const float* ids, float* o, int N, int D) {
+template <typename T>
+__global__ void k_embed(const T* table, const float* ids, T* o, int N, int D) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)N * D) return;
     int r = (int)(i / D), j = (int)(i % D);
     o[i] = table[(long long)((int)ids[r]) * D + j];
 }
-
-__global__ void k_embed_bwd(const float* g, const float* ids, float* dT, int N, int D) {
+// embed backward: grads accumulate fp32 (atomicAdd float)
+template <typename T>
+__global__ void k_embed_bwd(const T* g, const float* ids, float* dT, int N, int D) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)N * D) return;
     int r = (int)(i / D), j = (int)(i % D);
-    atomicAdd(&dT[(long long)((int)ids[r]) * D + j], g[i]);
+    atomicAdd(&dT[(long long)((int)ids[r]) * D + j], ldf(g, i));
 }
-
-// Fused CE: per row (block) max + sumexp; dlogits = (softmax - onehot)/N;
-// atomicAdd mean NLL into loss[0].
-__global__ void k_ce(const float* logits, const float* tgt, float* dlogits,
+template <typename T>
+__global__ void k_ce(const T* logits, const float* tgt, T* dlogits,
                      float* loss, int N, int V) {
     int r = blockIdx.x;
     if (r >= N) return;
     extern __shared__ float sh[];
-    const float* lr = logits + (long long)r * V;
+    const T* lr = logits + (long long)r * V;
     float mx = -1e30f;
-    for (int j = threadIdx.x; j < V; j += blockDim.x) mx = fmaxf(mx, lr[j]);
+    for (int j = threadIdx.x; j < V; j += blockDim.x) mx = fmaxf(mx, ldf(lr, j));
     sh[threadIdx.x] = mx; __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
@@ -251,7 +330,7 @@ __global__ void k_ce(const float* logits, const float* tgt, float* dlogits,
     }
     mx = sh[0]; __syncthreads();
     float se = 0.f;
-    for (int j = threadIdx.x; j < V; j += blockDim.x) se += expf(lr[j] - mx);
+    for (int j = threadIdx.x; j < V; j += blockDim.x) se += expf(ldf(lr, j) - mx);
     sh[threadIdx.x] = se; __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
@@ -261,106 +340,19 @@ __global__ void k_ce(const float* logits, const float* tgt, float* dlogits,
     int t = (int)tgt[r];
     float inv = 1.f / N;
     for (int j = threadIdx.x; j < V; j += blockDim.x) {
-        float p = expf(lr[j] - mx) / se;
-        dlogits[(long long)r * V + j] = (p - (j == t ? 1.f : 0.f)) * inv;
+        float p = expf(ldf(lr, j) - mx) / se;
+        stf(dlogits, (long long)r * V + j, (p - (j == t ? 1.f : 0.f)) * inv);
     }
     if (threadIdx.x == 0)
-        atomicAdd(loss, (logf(se) - (lr[t] - mx)) * inv);
+        atomicAdd(loss, (logf(se) - (ldf(lr, t) - mx)) * inv);
 }
-
-// [d0,d1,d2,d3] -> [d0,d2,d1,d3]
-__global__ void k_perm0213(const float* x, float* o, int d0, int d1, int d2, int d3) {
+__global__ void k_cast_f2b(const float* a, bf16* c, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)d0 * d1 * d2 * d3;
-    if (i >= total) return;
-    int j3 = i % d3;
-    long long r = i / d3;
-    int j2 = r % d2; r /= d2;
-    int j1 = r % d1; r /= d1;
-    int j0 = (int)r;
-    o[(((long long)j0 * d2 + j2) * d1 + j1) * d3 + j3] = x[i];
+    if (i < n) c[i] = __float2bfloat16(a[i]);
 }
-
-// Half-split RoPE on rows of [.., T, dh]: row index r -> t = r % T.
-// cos/sin: [T, dh/2]. Matches HF rotate_half exactly.
-__global__ void k_rope(const float* x, const float* cs, const float* sn,
-                       float* o, int T, int dh, long long rows) {
+__global__ void k_cast_b2f(const bf16* a, float* c, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = rows * dh;
-    if (i >= total) return;
-    int j = i % dh;
-    long long r = i / dh;
-    int t = (int)(r % T);
-    int half = dh / 2;
-    const float* xr = x + r * dh;
-    if (j < half) {
-        o[i] = xr[j] * cs[t * half + j] - xr[j + half] * sn[t * half + j];
-    } else {
-        int jj = j - half;
-        o[i] = xr[jj] * sn[t * half + jj] + xr[j] * cs[t * half + jj];
-    }
-}
-
-// Inverse rotation (rope backward): dx1 = g1*c + g2*s ; dx2 = -g1*s + g2*c
-__global__ void k_rope_inv(const float* g, const float* cs, const float* sn,
-                           float* o, int T, int dh, long long rows) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = rows * dh;
-    if (i >= total) return;
-    int j = i % dh;
-    long long r = i / dh;
-    int t = (int)(r % T);
-    int half = dh / 2;
-    const float* gr = g + r * dh;
-    if (j < half) {
-        o[i] = gr[j] * cs[t * half + j] + gr[j + half] * sn[t * half + j];
-    } else {
-        int jj = j - half;
-        o[i] = -gr[jj] * sn[t * half + jj] + gr[j] * cs[t * half + jj];
-    }
-}
-
-// Causal row softmax: rows = batch*T, width T; row r masks cols > (r % T).
-__global__ void k_softmax_causal(const float* x, float* o, int T, long long rows) {
-    long long r = blockIdx.x;
-    if (r >= rows) return;
-    int t = (int)(r % T);
-    extern __shared__ float sh[];
-    const float* xr = x + r * T;
-    float mx = -1e30f;
-    for (int j = threadIdx.x; j <= t; j += blockDim.x) mx = fmaxf(mx, xr[j]);
-    sh[threadIdx.x] = mx; __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
-        __syncthreads();
-    }
-    mx = sh[0]; __syncthreads();
-    float acc = 0.f;
-    for (int j = threadIdx.x; j <= t; j += blockDim.x) acc += expf(xr[j] - mx);
-    sh[threadIdx.x] = acc; __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    float denom = sh[0];
-    float* orow = o + r * T;
-    for (int j = threadIdx.x; j < T; j += blockDim.x)
-        orow[j] = (j <= t) ? expf(xr[j] - mx) / denom : 0.f;
-}
-
-// [B,KV,T,dh] -> [B,H,T,dh], grouped repeat: out head h reads kv head h/rep.
-__global__ void k_repeat_kv(const float* x, float* o, int B, int KV, int H,
-                            int T, int dh) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = (long long)B * H * T * dh;
-    if (i >= total) return;
-    int j = i % dh;
-    long long r = i / dh;
-    int t = r % T; r /= T;
-    int h = r % H; r /= H;
-    int b = (int)r;
-    int rep = H / KV;
-    o[i] = x[(((long long)b * KV + h / rep) * T + t) * dh + j];
+    if (i < n) c[i] = __bfloat162float(a[i]);
 }
 
 // ── API ─────────────────────────────────────────────────────────────────────
@@ -375,9 +367,9 @@ API int eng_init() {
     return 0;
 }
 
-API int eng_alloc(int idx, long long nfloats) {
+API int eng_alloc(int idx, long long nelems, int elsize) {
     if (idx < 0 || idx >= MAX_BUFS) return 1;
-    if (cudaMalloc(&g_bufs[idx], sizeof(float) * nfloats)) return 2;
+    if (cudaMalloc(&g_bufs[idx], nelems * elsize)) return 2;
     return 0;
 }
 
@@ -392,107 +384,173 @@ API int eng_download(int idx, float* host, long long nfloats) {
     return (int)cudaStreamSynchronize(g_stream);
 }
 
+static int gemm_ex(const EngOp* o) {
+    // row-major via col-major swap (validated recipes), GemmStridedBatchedEx.
+    const float one = 1.f, zero = 0.f;
+    float al = o->alpha == 0.f ? 1.f : o->alpha;
+    cudaDataType ab = (o->dt >= 1) ? CUDA_R_16BF : CUDA_R_32F;
+    cudaDataType cc = (o->dt == 1) ? CUDA_R_16BF : CUDA_R_32F;
+    const void* A = g_bufs[o->a];
+    const void* B = g_bufs[o->b];
+    void* C = g_bufs[o->c];
+    int batch = o->batch > 0 ? o->batch : 1;
+    long long sa = o->sa, sb = o->sb, sc = o->sc;
+    cublasOperation_t opa, opb;
+    const void *M1, *M2;
+    int ld1, ld2;
+    long long s1, s2;
+    if (o->tb == 0) {            // C = A @ B
+        opa = CUBLAS_OP_N; opb = CUBLAS_OP_N;
+        M1 = B; ld1 = o->n; s1 = sb;
+        M2 = A; ld2 = o->k; s2 = sa;
+    } else if (o->tb == 1) {     // C = A @ B^T, B row-major [n,k]
+        opa = CUBLAS_OP_T; opb = CUBLAS_OP_N;
+        M1 = B; ld1 = o->k; s1 = sb;
+        M2 = A; ld2 = o->k; s2 = sa;
+    } else {                     // tb=2: C[m,n] = A[k,m]^T @ B[k,n]
+        opa = CUBLAS_OP_N; opb = CUBLAS_OP_T;
+        M1 = B; ld1 = o->n; s1 = sb;
+        M2 = A; ld2 = o->m; s2 = sa;
+    }
+    (void)one;
+    return (int)cublasGemmStridedBatchedEx(g_blas, opa, opb,
+        o->n, o->m, o->k, &al,
+        M1, ab, ld1, s1,
+        M2, ab, ld2, s2,
+        &zero, C, cc, o->n, sc, batch,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+#define EL(T_) reinterpret_cast<T_*>
+#define CEL(T_) reinterpret_cast<const T_*>
+
 static int exec_op(const EngOp* op) {
     const int T = 256;
-    float* A = g_bufs[op->a];
-    float* B = op->b >= 0 ? g_bufs[op->b] : nullptr;
-    float* C = op->c >= 0 ? g_bufs[op->c] : nullptr;
-    float* D = op->d >= 0 ? g_bufs[op->d] : nullptr;
+    void* A = op->a >= 0 ? g_bufs[op->a] : nullptr;
+    void* B = op->b >= 0 ? g_bufs[op->b] : nullptr;
+    void* C = op->c >= 0 ? g_bufs[op->c] : nullptr;
+    void* D = op->d >= 0 ? g_bufs[op->d] : nullptr;
+    bool h = op->dt == 1;   // bf16 storage
     switch (op->kind) {
-        case OP_GEMM: {
-            // row-major C[m,n] = A[m,k] @ B[k,n]  == col-major C^T = B^T A^T
-            const float one = 1.f, zero = 0.f;
-            return (int)cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N,
-                                    op->n, op->m, op->k, &one,
-                                    B, op->n, A, op->k, &zero, C, op->n);
-        }
-        case OP_ADD:      k_add<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
-        case OP_MUL:      k_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
-        case OP_SILU_MUL: k_silu_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
-        case OP_RMSNORM:  k_rmsnorm<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, op->m, op->n, op->alpha); break;
+        case OP_GEMM: case OP_GEMM_SB:
+            return gemm_ex(op);
+        case OP_ADD:
+            if (h) k_add<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->n);
+            else   k_add<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->n);
+            break;
+        case OP_MUL:
+            if (h) k_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->n);
+            else   k_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->n);
+            break;
+        case OP_SILU_MUL:
+            if (h) k_silu_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->n);
+            else   k_silu_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->n);
+            break;
+        case OP_RMSNORM:
+            if (h) k_rmsnorm<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->m, op->n, op->alpha);
+            else   k_rmsnorm<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->m, op->n, op->alpha);
+            break;
         case OP_ADAMW: {
-            const float* tb_ptr = op->tb >= 0 ? g_bufs[op->tb] : nullptr;
-            k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, tb_ptr, op->alpha, op->beta, op->gamma, op->n);
+            const float* tb_ptr = op->tb >= 0 ? CEL(float)(g_bufs[op->tb]) : nullptr;
+            bf16* pbf = op->sa > 0 ? EL(bf16)(g_bufs[op->sa]) : nullptr;   // sa = bf16 mirror
+            k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(EL(float)(A), CEL(float)(B), EL(float)(C), EL(float)(D),
+                                                             tb_ptr, pbf, op->alpha, op->beta, op->gamma, op->n);
             break;
         }
-        case OP_SCALE:    k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->alpha, op->n); break;
-        case OP_COPY:     k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->n); break;
-        case OP_GEMM_SB: {
-            const float zero = 0.f;
-            float al = op->alpha == 0.f ? 1.f : op->alpha;
-            if (op->tb == 0) {
-                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_N, CUBLAS_OP_N,
-                    op->n, op->m, op->k, &al,
-                    B, op->n, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
-            } else if (op->tb == 1) {   // c = a @ b^T, b row-major [n,k]
-                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_T, CUBLAS_OP_N,
-                    op->n, op->m, op->k, &al,
-                    B, op->k, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
-            } else {                    // tb=2: c[m,n] = a[k,m]^T @ b[k,n]
-                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_N, CUBLAS_OP_T,
-                    op->n, op->m, op->k, &al,
-                    B, op->n, op->sb, A, op->m, op->sa, &zero, C, op->n, op->sc, op->batch);
-            }
-        }
+        case OP_SCALE:
+            if (h) k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->alpha, op->n);
+            else   k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->alpha, op->n);
+            break;
+        case OP_COPY:
+            if (h) k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->n);
+            else   k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->n);
+            break;
         case OP_PERM_0213: {
             long long total = (long long)op->m * op->n * op->k * op->batch;
-            k_perm0213<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->m, op->n, op->k, op->batch);
+            int blocks = (int)((total + T - 1) / T);
+            if (h) k_perm0213<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->m, op->n, op->k, op->batch);
+            else   k_perm0213<<<blocks, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->m, op->n, op->k, op->batch);
             break;
         }
         case OP_ROPE: {
-            long long rows = (long long)op->batch * op->m;   // batch=B*H, m=T
+            long long rows = (long long)op->batch * op->m;
             long long total = rows * op->n;
-            if (!op->tb)
-                k_rope<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
-            else
-                k_rope_inv<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
+            int blocks = (int)((total + T - 1) / T);
+            if (!op->tb) {
+                if (h) k_rope<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), CEL(float)(B), CEL(float)(D), EL(bf16)(C), op->m, op->n, rows);
+                else   k_rope<<<blocks, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), CEL(float)(D), EL(float)(C), op->m, op->n, rows);
+            } else {
+                if (h) k_rope_inv<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), CEL(float)(B), CEL(float)(D), EL(bf16)(C), op->m, op->n, rows);
+                else   k_rope_inv<<<blocks, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), CEL(float)(D), EL(float)(C), op->m, op->n, rows);
+            }
             break;
         }
         case OP_SOFTMAX_CAUSAL: {
-            long long rows = (long long)op->batch * op->m;   // batch=B*H, m=T
-            k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(A, C, op->m, rows);
+            long long rows = (long long)op->batch * op->m;
+            if (h) k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->m, rows);
+            else   k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), EL(float)(C), op->m, rows);
             break;
         }
         case OP_REPEAT_KV: {
-            long long total = (long long)op->batch * op->n * op->m * op->k;  // B*H*T*dh
-            k_repeat_kv<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->batch, op->tb, op->n, op->m, op->k);
+            long long total = (long long)op->batch * op->n * op->m * op->k;
+            int blocks = (int)((total + T - 1) / T);
+            if (h) k_repeat_kv<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->batch, op->tb, op->n, op->m, op->k);
+            else   k_repeat_kv<<<blocks, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->batch, op->tb, op->n, op->m, op->k);
             break;
         }
         case OP_RMSNORM_BWD:
-            k_rmsnorm_bwd<<<op->m, T, 2 * T * sizeof(float), g_stream>>>(A, B, D, C, g_bufs[op->tb], op->m, op->n, op->alpha);
+            if (h) k_rmsnorm_bwd<<<op->m, T, 2 * T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), EL(bf16)(C), EL(bf16)(g_bufs[op->tb]), op->m, op->n, op->alpha);
+            else   k_rmsnorm_bwd<<<op->m, T, 2 * T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), CEL(float)(D), EL(float)(C), EL(float)(g_bufs[op->tb]), op->m, op->n, op->alpha);
             break;
         case OP_COLSUM:
-            k_colsum<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->m, op->n);
+            if (op->dt >= 1) k_colsum<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), EL(float)(C), op->m, op->n);
+            else             k_colsum<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->m, op->n);
             break;
         case OP_REPEAT_KV_BWD: {
-            long long total = (long long)op->batch * op->tb * op->m * op->k;  // B*KV*T*dh
-            k_repeat_kv_bwd<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->batch, op->tb, op->n, op->m, op->k);
+            long long total = (long long)op->batch * op->tb * op->m * op->k;
+            int blocks = (int)((total + T - 1) / T);
+            if (h) k_repeat_kv_bwd<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->batch, op->tb, op->n, op->m, op->k);
+            else   k_repeat_kv_bwd<<<blocks, T, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->batch, op->tb, op->n, op->m, op->k);
             break;
         }
         case OP_SOFTMAX_BWD: {
             long long rows = (long long)op->batch * op->m;
-            k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(A, B, C, op->m, rows);
+            if (h) k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->m, rows);
+            else   k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->m, rows);
             break;
         }
         case OP_SILU_BWD:
-            k_silu_bwd<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, D, C, g_bufs[op->tb], op->n);
+            if (h) k_silu_bwd<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), EL(bf16)(C), EL(bf16)(g_bufs[op->tb]), op->n);
+            else   k_silu_bwd<<<(op->n + T - 1) / T, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), CEL(float)(D), EL(float)(C), EL(float)(g_bufs[op->tb]), op->n);
             break;
         case OP_EMBED: {
             long long total = (long long)op->m * op->n;
-            k_embed<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, C, op->m, op->n);
+            int blocks = (int)((total + T - 1) / T);
+            if (h) k_embed<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), CEL(float)(B), EL(bf16)(C), op->m, op->n);
+            else   k_embed<<<blocks, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->m, op->n);
             break;
         }
         case OP_EMBED_BWD: {
             long long total = (long long)op->m * op->n;
-            k_embed_bwd<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, C, op->m, op->n);
+            int blocks = (int)((total + T - 1) / T);
+            if (op->dt >= 1) k_embed_bwd<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), CEL(float)(B), EL(float)(C), op->m, op->n);
+            else             k_embed_bwd<<<blocks, T, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->m, op->n);
             break;
         }
         case OP_CE:
-            k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, D, op->m, op->n);
+            if (h) k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(float)(B), EL(bf16)(C), EL(float)(D), op->m, op->n);
+            else   k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), EL(float)(D), op->m, op->n);
             break;
         case OP_TICK:
-            k_tick<<<1, 1, 0, g_stream>>>(A);
+            k_tick<<<1, 1, 0, g_stream>>>(EL(float)(A));
             break;
+        case OP_CAST: {
+            long long n = ((long long)op->m) * (op->n > 0 ? op->n : 1);
+            int blocks = (int)((n + T - 1) / T);
+            if (op->tb == 0) k_cast_f2b<<<blocks, T, 0, g_stream>>>(CEL(float)(A), EL(bf16)(C), n);
+            else             k_cast_b2f<<<blocks, T, 0, g_stream>>>(CEL(bf16)(A), EL(float)(C), n);
+            break;
+        }
         default: return 100;
     }
     return 0;

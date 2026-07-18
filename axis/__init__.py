@@ -17,7 +17,7 @@ from axis import lora
 from axis.generate import generate
 from axis.tokenizer import HFTokenizer
 
-__version__ = "0.11.3"
+__version__ = "0.12.0"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",

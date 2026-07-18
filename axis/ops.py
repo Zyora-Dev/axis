@@ -385,27 +385,32 @@ def silu_mul(g: Tensor, u: Tensor) -> Tensor:
 def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
     """Causal attention in one op: softmax(mask(q@k^T * scale)) @ v.
 
-    q, k, v: [B, H, T, D]. One kernel launch on GPU (scores + mask + stable
-    softmax + weighted sum fused); NumPy fallback computes the identical math.
-    One tape node instead of five — backward is the standard attention
-    backward over the saved probabilities, with its matmuls routed through the
-    GPU too.
+    q, k, v: [B, H, T, D]. Flash-attention-style memory: the O(T^2)
+    probability matrix is NOT saved for backward — it is recomputed from q and
+    k (bit-identical math, so gradients are unchanged). This removes the
+    dominant [B, H, T, T] per-layer activation from peak memory, at the cost of
+    one extra matmul + softmax in backward.
     """
     B, H, T, D = q.shape
-    fused = accel.fused_causal_attention(q.data, k.data, v.data, scale)
-    if fused is not None:
-        data, probs = fused
-    else:
-        xp = array_module(q.data)
-        scores = _mm(q.data, np.ascontiguousarray(np.swapaxes(k.data, -1, -2))) * scale
+
+    def _probs(qd, kd):
+        xp = array_module(qd)
+        scores = _mm(qd, np.ascontiguousarray(np.swapaxes(kd, -1, -2))) * scale
         mask = xp.triu(xp.full((T, T), -1e30, dtype=_np.float32), k=1)
         scores = scores + mask[None, None]
         shifted = scores - scores.max(axis=-1, keepdims=True)
         e = np.exp(shifted)
-        probs = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)
-        data = _mm(probs, v.data)
+        return (e / e.sum(axis=-1, keepdims=True)).astype(_np.float32)
+
+    fused = accel.fused_causal_attention(q.data, k.data, v.data, scale)
+    if fused is not None:
+        data, _ = fused          # discard probs — recomputed in backward
+    else:
+        data = _mm(_probs(q.data, k.data), v.data)
 
     def backward(grad):
+        # Recompute P from q, k (parents — still alive during this backward).
+        probs = _probs(q.data, k.data)
         # dV = P^T @ dO
         p_t = np.ascontiguousarray(np.swapaxes(probs, -1, -2))
         dv = _mm(p_t, grad)

@@ -278,9 +278,18 @@ class CausalSelfAttention(Module):
         k = apply_rope(k, self._cos, self._sin)
 
         if rep > 1:
-            # Repeat KV heads to match Q heads (GQA expansion).
-            k = ops.cat([k] * rep, axis=1)
-            v = ops.cat([v] * rep, axis=1)
+            # GQA expansion — must match HF `repeat_kv`: each kv head is
+            # repeated `rep` times CONTIGUOUSLY (grouped), so query head j pairs
+            # with kv head j // rep. A tiled cat([k]*rep) would instead map head
+            # j to kv j % n_kv — the wrong pairing.
+            def repeat_kv(t: Tensor) -> Tensor:
+                parts = []
+                for i in range(self.n_kv_heads):
+                    head_i = ops.getitem(t, (slice(None), slice(i, i + 1)))
+                    parts.extend([head_i] * rep)
+                return ops.cat(parts, axis=1)
+            k = repeat_kv(k)
+            v = repeat_kv(v)
 
         # Fused: scores + causal mask + stable softmax + weighted sum in one
         # op (single GPU kernel when acceleration is enabled).

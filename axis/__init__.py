@@ -15,8 +15,9 @@ from axis.pretrained import from_pretrained, read_safetensors
 from axis.data import ByteTokenizer, LMDataset, DataLoader
 from axis import lora
 from axis.generate import generate
+from axis.tokenizer import HFTokenizer
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",
@@ -26,5 +27,6 @@ __all__ = [
     "from_pretrained", "read_safetensors",
     "ByteTokenizer", "LMDataset", "DataLoader",
     "lora", "generate",
+    "HFTokenizer",
     "__version__",
 ]

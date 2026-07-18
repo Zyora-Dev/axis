@@ -25,13 +25,20 @@ enum OpKind {
     OP_ADAMW = 5,      // fused AdamW: p,m,v updated from g (n elements)
     OP_SCALE = 6,      // c = a * alpha
     OP_COPY = 7,       // c = a
+    OP_GEMM_SB = 8,    // strided-batched: c[i][m,n] = alpha * a[i][m,k] @ b[i][k,n or n,k^T]
+    OP_PERM_0213 = 9,  // [d0,d1,d2,d3] -> [d0,d2,d1,d3]  (dims m,n,k,batch = d0..d3)
+    OP_ROPE = 10,      // half-split rotary on [rows, dh]; cos=b, sin=d, T=m, dh=n
+    OP_SOFTMAX_CAUSAL = 11, // rows = batch*T, row r masks cols > r%T; width n=T
+    OP_REPEAT_KV = 12, // [B,KV,T,dh] -> [B,H,T,dh], grouped (h -> h/rep)
 };
 
 typedef struct {
     int   kind;
     int   a, b, c, d;   // buffer indices (op-specific roles)
     int   m, n, k;      // dims
-    float alpha, beta;  // scalars (eps, lr, ...)
+    int   batch, tb;    // batch count, transpose-B flag
+    int   sa, sb, sc;   // per-batch strides (elements)
+    float alpha, beta;  // scalars (eps, lr, scale, ...)
 } EngOp;
 
 // ── global state ────────────────────────────────────────────────────────────
@@ -99,6 +106,82 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v,
     p[i] = pi - lr * mh / (sqrtf(vh) + eps);
 }
 
+// [d0,d1,d2,d3] -> [d0,d2,d1,d3]
+__global__ void k_perm0213(const float* x, float* o, int d0, int d1, int d2, int d3) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)d0 * d1 * d2 * d3;
+    if (i >= total) return;
+    int j3 = i % d3;
+    long long r = i / d3;
+    int j2 = r % d2; r /= d2;
+    int j1 = r % d1; r /= d1;
+    int j0 = (int)r;
+    o[(((long long)j0 * d2 + j2) * d1 + j1) * d3 + j3] = x[i];
+}
+
+// Half-split RoPE on rows of [.., T, dh]: row index r -> t = r % T.
+// cos/sin: [T, dh/2]. Matches HF rotate_half exactly.
+__global__ void k_rope(const float* x, const float* cs, const float* sn,
+                       float* o, int T, int dh, long long rows) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = rows * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = (int)(r % T);
+    int half = dh / 2;
+    const float* xr = x + r * dh;
+    if (j < half) {
+        o[i] = xr[j] * cs[t * half + j] - xr[j + half] * sn[t * half + j];
+    } else {
+        int jj = j - half;
+        o[i] = xr[jj] * sn[t * half + jj] + xr[j] * cs[t * half + jj];
+    }
+}
+
+// Causal row softmax: rows = batch*T, width T; row r masks cols > (r % T).
+__global__ void k_softmax_causal(const float* x, float* o, int T, long long rows) {
+    long long r = blockIdx.x;
+    if (r >= rows) return;
+    int t = (int)(r % T);
+    extern __shared__ float sh[];
+    const float* xr = x + r * T;
+    float mx = -1e30f;
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) mx = fmaxf(mx, xr[j]);
+    sh[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = sh[0]; __syncthreads();
+    float acc = 0.f;
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) acc += expf(xr[j] - mx);
+    sh[threadIdx.x] = acc; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float denom = sh[0];
+    float* orow = o + r * T;
+    for (int j = threadIdx.x; j < T; j += blockDim.x)
+        orow[j] = (j <= t) ? expf(xr[j] - mx) / denom : 0.f;
+}
+
+// [B,KV,T,dh] -> [B,H,T,dh], grouped repeat: out head h reads kv head h/rep.
+__global__ void k_repeat_kv(const float* x, float* o, int B, int KV, int H,
+                            int T, int dh) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)B * H * T * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = r % T; r /= T;
+    int h = r % H; r /= H;
+    int b = (int)r;
+    int rep = H / KV;
+    o[i] = x[(((long long)b * KV + h / rep) * T + t) * dh + j];
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 API int eng_init() {
     if (cublasCreate(&g_blas)) return 1;
@@ -149,6 +232,42 @@ static int exec_op(const EngOp* op) {
         case OP_ADAMW:    k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, op->alpha, op->beta, op->m / 1e6f, op->k / 1e6f, op->n); break;
         case OP_SCALE:    k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->alpha, op->n); break;
         case OP_COPY:     k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->n); break;
+        case OP_GEMM_SB: {
+            // row-major batched: C[i][m,n] = alpha * A[i][m,k] @ (B[i][k,n] or B[i][n,k]^T)
+            const float zero = 0.f;
+            float al = op->alpha == 0.f ? 1.f : op->alpha;
+            if (!op->tb) {
+                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_N, CUBLAS_OP_N,
+                    op->n, op->m, op->k, &al,
+                    B, op->n, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
+            } else {
+                // B row-major [n,k], want A @ B^T
+                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    op->n, op->m, op->k, &al,
+                    B, op->k, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
+            }
+        }
+        case OP_PERM_0213: {
+            long long total = (long long)op->m * op->n * op->k * op->batch;
+            k_perm0213<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->m, op->n, op->k, op->batch);
+            break;
+        }
+        case OP_ROPE: {
+            long long rows = (long long)op->batch * op->m;   // batch=B*H, m=T
+            long long total = rows * op->n;
+            k_rope<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
+            break;
+        }
+        case OP_SOFTMAX_CAUSAL: {
+            long long rows = (long long)op->batch * op->m;   // batch=B*H, m=T
+            k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(A, C, op->m, rows);
+            break;
+        }
+        case OP_REPEAT_KV: {
+            long long total = (long long)op->batch * op->n * op->m * op->k;  // B*H*T*dh
+            k_repeat_kv<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->batch, op->tb, op->n, op->m, op->k);
+            break;
+        }
         default: return 100;
     }
     return 0;

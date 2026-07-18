@@ -14,7 +14,8 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 # op kinds — must match runtime.cu
-GEMM, ADD, MUL, SILU_MUL, RMSNORM, ADAMW, SCALE, COPY = range(8)
+(GEMM, ADD, MUL, SILU_MUL, RMSNORM, ADAMW, SCALE, COPY,
+ GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV) = range(13)
 
 
 class _EngOp(ctypes.Structure):
@@ -23,14 +24,24 @@ class _EngOp(ctypes.Structure):
         ("a", ctypes.c_int), ("b", ctypes.c_int),
         ("c", ctypes.c_int), ("d", ctypes.c_int),
         ("m", ctypes.c_int), ("n", ctypes.c_int), ("k", ctypes.c_int),
+        ("batch", ctypes.c_int), ("tb", ctypes.c_int),
+        ("sa", ctypes.c_int), ("sb", ctypes.c_int), ("sc", ctypes.c_int),
         ("alpha", ctypes.c_float), ("beta", ctypes.c_float),
     ]
 
 
 def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
        m: int = 0, n: int = 0, k: int = 0,
+       batch: int = 0, tb: int = 0, sa: int = 0, sb: int = 0, sc: int = 0,
        alpha: float = 0.0, beta: float = 0.0) -> Tuple:
-    return (kind, a, b, c, d, m, n, k, alpha, beta)
+    """Op descriptor. Notable role maps:
+    GEMM_SB:  c[i][m,n] = alpha * a[i][m,k] @ b[i][k,n]  (tb=1: b is [n,k], b^T)
+    PERM_0213: dims (m,n,k,batch) = (d0,d1,d2,d3), out [d0,d2,d1,d3]
+    ROPE:     a=[batch*m rows, n]; b=cos, d=sin ([m, n/2]); batch=B*H, m=T, n=dh
+    SOFTMAX_CAUSAL: rows batch*m width m (T); a->c
+    REPEAT_KV: a=[batch,tb,m,k] (B,KV,T,dh) -> c=[batch,n,m,k] (B,H,T,dh)
+    """
+    return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, alpha, beta)
 
 
 class Engine:
@@ -83,7 +94,7 @@ class Engine:
     def _pack(self, plan: Sequence[Tuple]):
         arr = (_EngOp * len(plan))()
         for i, o in enumerate(plan):
-            arr[i] = _EngOp(*[int(x) if j < 8 else float(x) for j, x in enumerate(o)])
+            arr[i] = _EngOp(*[int(x) if j < 13 else float(x) for j, x in enumerate(o)])
         return arr
 
     def run(self, plan: Sequence[Tuple], sync: bool = True) -> None:

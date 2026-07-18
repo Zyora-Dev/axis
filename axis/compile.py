@@ -18,13 +18,16 @@ import numpy as np
 from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
                          RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD,
-                         SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW)
+                         SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK)
 
 
 class CompiledTransformer:
     def __init__(self, lib_path: str, cfg: dict, weights: Dict[str, np.ndarray],
                  batch: int, seq: int, lr: float = 3e-4, wd: float = 0.1,
-                 eps: float = 1e-5, tf32: bool = True):
+                 eps: float = 1e-5, tf32: bool = True, recompute_attn: bool = True):
+        """recompute_attn=True (default): attention probabilities are NOT saved
+        per block — backward recomputes them (flash-attention-style). Removes
+        the O(T^2)-per-block activation, enabling long sequences at depth."""
         self.cfg = cfg
         self.B, self.T = batch, seq
         self.lr, self.wd = lr, wd
@@ -85,7 +88,10 @@ class CompiledTransformer:
         q2s = [A(N * H * DH) for _ in range(L)]
         krs = [A(N * H * DH) for _ in range(L)]
         vrs = [A(N * H * DH) for _ in range(L)]
-        prs = [A(BH * T * T) for _ in range(L)]
+        # attention probs: with recompute_attn, ONE shared buffer (recomputed in
+        # bwd); otherwise saved per block (O(T^2) each — short seq only).
+        pr_shared = A(BH * T * T)
+        prs = [pr_shared] * L if recompute_attn else [A(BH * T * T) for _ in range(L)]
         at2s = [A(N * H * DH) for _ in range(L)]
         r1s = [A(N * D) for _ in range(L)]
         zs = [A(N * D) for _ in range(L)]
@@ -198,6 +204,15 @@ class CompiledTransformer:
                 op(GEMM_SB, a=dr1, b=P[p + "attn.o_proj.weight"], c=dat2, m=N, k=D, n=H * DH, batch=1, tb=1),
                 op(GEMM_SB, a=at2s[i], b=dr1, c=G[p + "attn.o_proj.weight"], m=H * DH, n=D, k=N, batch=1, tb=2),
                 op(PERM_0213, a=dat2, c=dat, m=B, n=T, k=H, batch=DH),
+            ]
+            if recompute_attn:
+                # rebuild probs from saved q2/kr (flash-attn-style memory)
+                plan += [
+                    op(GEMM_SB, a=q2s[i], b=krs[i], c=sc_, m=T, k=DH, n=T, batch=BH, tb=1,
+                       sa=T * DH, sb=T * DH, sc=T * T, alpha=scale),
+                    op(SOFTMAX_CAUSAL, a=sc_, c=prs[i], batch=BH, m=T),
+                ]
+            plan += [
                 op(GEMM_SB, a=dat, b=vrs[i], c=dpr, m=T, k=DH, n=T, batch=BH, tb=1,
                    sa=T * DH, sb=T * DH, sc=T * T),
                 op(GEMM_SB, a=prs[i], b=dat, c=dvr, m=T, n=DH, k=T, batch=BH, tb=2,
@@ -235,6 +250,16 @@ class CompiledTransformer:
         self.plan_fb = plan          # forward+backward (loss+grads)
         self._mb, self._vb = mb, vb
         self._captured = False
+        # device-side step counter: TICK increments, AdamW reads it and does
+        # bias correction ON DEVICE — exact under CUDA graph replay.
+        self.b_t = eng.new_tensor(np.zeros(1, dtype=np.float32))
+        self.plan_step = (self.plan_fb
+                          + [op(TICK, a=self.b_t)]
+                          + [op(ADAMW, a=self.pb[nm], b=self.gbuf[nm],
+                                c=self._mb[nm], d=self._vb[nm], tb=self.b_t,
+                                n=int(np.prod(self.shapes[nm])),
+                                alpha=self.lr, beta=self.lr * self.wd, gamma=1e-8)
+                             for nm in self.pnames])
 
     def _adamw_ops(self, t: int):
         bc1 = 1.0 - 0.9 ** t
@@ -242,20 +267,29 @@ class CompiledTransformer:
         a_lr = self.lr * float(np.sqrt(bc2)) / bc1
         g_eps = 1e-8 * float(np.sqrt(bc2))
         return [op(ADAMW, a=self.pb[nm], b=self.gbuf[nm], c=self._mb[nm], d=self._vb[nm],
-                   n=int(np.prod(self.shapes[nm])), alpha=a_lr, beta=self.lr * self.wd,
-                   gamma=g_eps) for nm in self.pnames]
+                   tb=-1, n=int(np.prod(self.shapes[nm])), alpha=a_lr,
+                   beta=self.lr * self.wd, gamma=g_eps) for nm in self.pnames]
 
     # ── API ──
-    def step(self, tokens: np.ndarray, targets: np.ndarray, t: int = 1) -> float:
-        """One full training step (eager plan run). Returns loss."""
+    def step(self, tokens: np.ndarray, targets: np.ndarray, t: int = None) -> float:
+        """One full training step (single native call). If t is given, uses
+        host-folded bias correction (parity tests); otherwise the device-side
+        step counter (TICK) handles it — the graph-correct default."""
         self.eng.upload(self.b_ids, tokens.reshape(-1).astype(np.float32))
         self.eng.upload(self.b_tgt, targets.reshape(-1).astype(np.float32))
-        self.eng.run(self.plan_fb + self._adamw_ops(t), sync=False)
+        if t is None:
+            self.eng.run(self.plan_step, sync=False)
+        else:
+            self.eng.run(self.plan_fb + self._adamw_ops(t), sync=False)
         return float(self.eng.download(self.b_loss, (1,))[0])
 
-    def capture(self, t: int = 1) -> None:
-        """Capture the whole step as a CUDA graph (fixed bias-correction t)."""
-        self.eng.capture(self.plan_fb + self._adamw_ops(t))
+    def capture(self, t: int = None) -> None:
+        """Capture the whole step as a CUDA graph. Default: device-side t —
+        bias correction stays exact across replays."""
+        if t is None:
+            self.eng.capture(self.plan_step)
+        else:
+            self.eng.capture(self.plan_fb + self._adamw_ops(t))
         self._captured = True
 
     def replay_step(self, tokens: np.ndarray, targets: np.ndarray) -> float:
@@ -267,3 +301,26 @@ class CompiledTransformer:
     def grads(self) -> Dict[str, np.ndarray]:
         return {nm: self.eng.download(self.gbuf[nm], self.shapes[nm])
                 for nm in self.pnames}
+
+
+def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
+                  lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
+                  recompute_attn: bool = True) -> CompiledTransformer:
+    """Compile an axis.nn.Transformer instance into a native training step.
+
+        ct = axis.compile_model(model, batch=8, seq=2048)
+        for step, (x, y) in enumerate(loader):
+            loss = ct.step(x, y)          # ONE native call — fwd+bwd+AdamW
+    """
+    blk = model.blocks[0]
+    cfg = dict(vocab_size=model.embed.weight.shape[0],
+               dim=model.embed.weight.shape[1],
+               n_layers=len(model.blocks),
+               n_heads=blk.attn.n_heads,
+               n_kv_heads=blk.attn.n_kv_heads,
+               mlp_hidden=blk.mlp.gate_proj.weight.shape[1],
+               tie_embeddings=model.tie_embeddings)
+    weights = {n: p.data for n, p in model.named_parameters()}
+    return CompiledTransformer(lib_path, cfg, weights, batch, seq,
+                               lr=lr, wd=wd, tf32=tf32,
+                               recompute_attn=recompute_attn)

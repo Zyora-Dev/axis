@@ -38,6 +38,7 @@ enum OpKind {
     OP_EMBED = 18,     // a=table[V,D] b=ids(float)[N] -> c=out[N,D]; m=N n=D
     OP_EMBED_BWD = 19, // a=g[N,D] b=ids -> atomicAdd into c=dTable; m=N n=D
     OP_CE = 20,        // a=logits[N,V] b=targets(float)[N] -> c=dlogits, d=loss(1); m=N n=V
+    OP_TICK = 21,      // a: t-buffer (1 float) += 1
 };
 
 typedef struct {
@@ -98,11 +99,28 @@ __global__ void k_rmsnorm(const float* x, const float* w, float* o,
     for (int j = threadIdx.x; j < dim; j += blockDim.x)
         o[r * dim + j] = x[r * dim + j] * inv * w[j];
 }
-// Fused AdamW (proper): moments beta1=.9 beta2=.95; alpha = lr*sqrt(bc2)/bc1,
-// beta = lr*wd (decoupled decay), gamma = eps*sqrt(bc2). Folded bias correction.
+// Fused AdamW. Two modes:
+//  tbuf == nullptr: folded constants (alpha=lr*sqrt(bc2)/bc1, beta=lr*wd,
+//                   gamma=eps*sqrt(bc2)) — fixed t.
+//  tbuf != nullptr: t read from device buffer (OP_TICK increments it), bias
+//                   correction computed ON DEVICE — exact under CUDA graphs.
+//                   alpha=lr, beta=lr*wd, gamma=eps.
 __global__ void k_adamw(float* p, const float* g, float* m, float* v,
-                        float alpha, float beta, float gamma, int n) {
+                        const float* tbuf, float alpha, float beta, float gamma, int n) {
     const float b1 = 0.9f, b2 = 0.95f;
+    __shared__ float s_alpha, s_gamma;
+    if (threadIdx.x == 0) {
+        if (tbuf) {
+            float t = tbuf[0];
+            float bc1 = 1.f - powf(b1, t);
+            float bc2 = 1.f - powf(b2, t);
+            s_alpha = alpha * sqrtf(bc2) / bc1;
+            s_gamma = gamma * sqrtf(bc2);
+        } else {
+            s_alpha = alpha; s_gamma = gamma;
+        }
+    }
+    __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gi = g[i];
@@ -110,8 +128,10 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v,
     float vi = b2 * v[i] + (1.f - b2) * gi * gi;
     m[i] = mi; v[i] = vi;
     float pi = p[i] * (1.f - beta);
-    p[i] = pi - alpha * mi / (sqrtf(vi) + gamma);
+    p[i] = pi - s_alpha * mi / (sqrtf(vi) + s_gamma);
 }
+
+__global__ void k_tick(float* t) { if (threadIdx.x == 0 && blockIdx.x == 0) t[0] += 1.f; }
 
 // rmsnorm backward: per row two reductions (ss, gwx); dx out; tmp = g*x*inv for dw.
 __global__ void k_rmsnorm_bwd(const float* x, const float* w, const float* g,
@@ -390,7 +410,11 @@ static int exec_op(const EngOp* op) {
         case OP_MUL:      k_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
         case OP_SILU_MUL: k_silu_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
         case OP_RMSNORM:  k_rmsnorm<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, op->m, op->n, op->alpha); break;
-        case OP_ADAMW:    k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, op->alpha, op->beta, op->gamma, op->n); break;
+        case OP_ADAMW: {
+            const float* tb_ptr = op->tb >= 0 ? g_bufs[op->tb] : nullptr;
+            k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, tb_ptr, op->alpha, op->beta, op->gamma, op->n);
+            break;
+        }
         case OP_SCALE:    k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->alpha, op->n); break;
         case OP_COPY:     k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->n); break;
         case OP_GEMM_SB: {
@@ -465,6 +489,9 @@ static int exec_op(const EngOp* op) {
         }
         case OP_CE:
             k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, D, op->m, op->n);
+            break;
+        case OP_TICK:
+            k_tick<<<1, 1, 0, g_stream>>>(A);
             break;
         default: return 100;
     }

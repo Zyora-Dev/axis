@@ -14,8 +14,9 @@ from axis.gradcheck import gradcheck
 from axis.pretrained import from_pretrained, read_safetensors
 from axis.data import ByteTokenizer, LMDataset, DataLoader
 from axis import lora
+from axis.generate import generate
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",
@@ -24,6 +25,6 @@ __all__ = [
     "save", "load", "gradcheck",
     "from_pretrained", "read_safetensors",
     "ByteTokenizer", "LMDataset", "DataLoader",
-    "lora",
+    "lora", "generate",
     "__version__",
 ]

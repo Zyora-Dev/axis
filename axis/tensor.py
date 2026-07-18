@@ -75,14 +75,22 @@ class Tensor:
     ):
         if isinstance(data, Tensor):
             data = data.data
-        arr = np.asarray(data)
+        from axis import backend as _B
+        if _B.is_gpu_array(data):
+            arr = data                       # keep on GPU
+        else:
+            arr = np.asarray(data)
         if arr.dtype in (np.float64, np.float16):
             arr = arr.astype(np.float32)
         elif arr.dtype in (np.int32, np.int8, np.uint8, np.int16):
             arr = arr.astype(np.int64)
         elif arr.dtype == np.bool_:
             arr = arr.astype(np.float32)
-        self.data: np.ndarray = arr
+        # Move onto the active device so constants/batches don't stay on host
+        # while the model is on the GPU (cupy rejects mixed numpy+cupy ops).
+        if _B.device() == "gpu" and not _B.is_gpu_array(arr):
+            arr = _B.to_gpu_array(arr)
+        self.data = arr
         self.grad: Optional[np.ndarray] = None
         self.requires_grad: bool = bool(requires_grad) and is_grad_enabled()
         self._backward: Optional[Callable[[np.ndarray], None]] = None
@@ -116,7 +124,8 @@ class Tensor:
         return ops.transpose(self)
 
     def numpy(self) -> np.ndarray:
-        return self.data
+        from axis import backend as _B
+        return _B.to_numpy(self.data)
 
     def item(self) -> float:
         return float(self.data.reshape(-1)[0])
@@ -139,8 +148,11 @@ class Tensor:
         if grad is None:
             if self.size != 1:
                 raise RuntimeError("backward() without grad only allowed on scalars")
-            grad = np.ones_like(self.data)
-        grad = np.asarray(grad, dtype=self.data.dtype)
+            from axis import backend as _B
+            grad = _B.array_module(self.data).ones_like(self.data)
+        else:
+            from axis import backend as _B
+            grad = _B.array_module(self.data).asarray(grad, dtype=self.data.dtype)
 
         # Topological order (iterative — no recursion limit issues on deep nets).
         topo: list[Tensor] = []

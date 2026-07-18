@@ -12,6 +12,7 @@ from typing import Iterable
 import numpy as np
 
 from axis import accel
+from axis.backend import array_module
 from axis.nn import Parameter
 
 
@@ -30,8 +31,8 @@ class AdamW:
         self.eps = eps
         self.weight_decay = weight_decay
         self.t = 0
-        self._m = [np.zeros_like(p.data) for p in self.params]
-        self._v = [np.zeros_like(p.data) for p in self.params]
+        self._m = [array_module(p.data).zeros_like(p.data) for p in self.params]
+        self._v = [array_module(p.data).zeros_like(p.data) for p in self.params]
 
     def step(self) -> None:
         self.t += 1
@@ -49,7 +50,7 @@ class AdamW:
             # Decoupled weight decay (applied directly to weights).
             if self.weight_decay > 0.0:
                 p.data *= (1.0 - self.lr * self.weight_decay)
-            p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            p.data -= self.lr * m_hat / (array_module(v_hat).sqrt(v_hat) + self.eps)
             accel.invalidate(p)  # weights changed in place — drop stale GPU cache
 
     def zero_grad(self) -> None:
@@ -77,7 +78,7 @@ class SGD:
         self.params = list(params)
         self.lr = lr
         self.momentum = momentum
-        self._buf = [np.zeros_like(p.data) for p in self.params]
+        self._buf = [array_module(p.data).zeros_like(p.data) for p in self.params]
 
     def step(self) -> None:
         for i, p in enumerate(self.params):

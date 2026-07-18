@@ -12,14 +12,18 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
-import numpy as np
+import numpy as _np
 
+from axis.backend import xp as np, array_module, is_gpu_array, scatter_add
 from axis.tensor import Tensor, is_grad_enabled
 from axis import accel
 
 
-def _mm(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Matmul that tries the GPU (locomp) and falls back to NumPy."""
+def _mm(a, b):
+    """Matmul. On GPU arrays this is cuBLAS via `a @ b`; on CPU it tries the
+    locomp kernel then falls back to NumPy BLAS."""
+    if is_gpu_array(a) or is_gpu_array(b):
+        return a @ b
     out = accel.matmul(a, b)
     return out if out is not None else a @ b
 
@@ -266,8 +270,8 @@ def transpose(a: Tensor, d0: int = -2, d1: int = -1) -> Tensor:
 def getitem(a: Tensor, idx) -> Tensor:
     data = a.data[idx]
     def backward(g):
-        full = np.zeros_like(a.data, dtype=g.dtype)
-        np.add.at(full, idx, g)
+        full = array_module(a.data).zeros_like(a.data, dtype=g.dtype)
+        scatter_add(full, idx, g)
         return [(a, full)]
     return _make(data, (a,), "getitem", backward)
 
@@ -317,11 +321,12 @@ def log_softmax(a: Tensor, axis: int = -1) -> Tensor:
 
 def embedding(weight: Tensor, indices: Tensor) -> Tensor:
     """weight[V, D] gathered by integer indices[...]. Backward = scatter-add."""
-    idx = indices.data.astype(np.int64)
+    xp = array_module(weight.data)
+    idx = xp.asarray(indices.data).astype(_np.int64)  # index on the same device
     data = weight.data[idx]
     def backward(g):
-        gw = np.zeros_like(weight.data)
-        np.add.at(gw, idx, g)
+        gw = xp.zeros_like(weight.data)
+        scatter_add(gw, idx, g)
         return [(weight, gw)]
     return _make(data, (weight,), "embedding", backward)
 
@@ -332,7 +337,8 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
     logits: [N, V] float. targets: [N] int64. Fused log-softmax + NLL for
     numerical stability (never materializes softmax probabilities in fp32 sums).
     """
-    t = targets.data.astype(np.int64).reshape(-1)
+    xp = array_module(logits.data)
+    t = xp.asarray(targets.data).astype(_np.int64).reshape(-1)
     x = logits.data.reshape(-1, logits.shape[-1])
     valid = t != ignore_index
     n_valid = int(valid.sum())
@@ -342,17 +348,18 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
     shifted = x - x.max(axis=-1, keepdims=True)
     lse = np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
     logp = shifted - lse  # [N, V]
-    safe_t = np.where(valid, t, 0)
-    nll = -logp[np.arange(x.shape[0]), safe_t]
-    nll = np.where(valid, nll, 0.0)
-    data = np.float32(nll.sum() / n_valid)
+    rows = xp.arange(x.shape[0])
+    safe_t = xp.where(valid, t, 0)
+    nll = -logp[rows, safe_t]
+    nll = xp.where(valid, nll, 0.0)
+    data = _np.float32(float(nll.sum()) / n_valid)
 
     def backward(g):
         # d/dx = (softmax(x) - onehot(t)) / n_valid, zeroed on ignored rows
-        p = np.exp(logp)
-        p[np.arange(x.shape[0]), safe_t] -= 1.0
+        p = xp.exp(logp)
+        p[rows, safe_t] -= 1.0
         p *= (valid[:, None] / n_valid)
-        return [(logits, (g * p).reshape(logits.shape).astype(np.float32))]
+        return [(logits, (g * p).reshape(logits.shape).astype(_np.float32))]
 
     return _make(data, (logits,), "cross_entropy", backward)
 
@@ -389,8 +396,9 @@ def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Ten
     if fused is not None:
         data, probs = fused
     else:
+        xp = array_module(q.data)
         scores = _mm(q.data, np.ascontiguousarray(np.swapaxes(k.data, -1, -2))) * scale
-        mask = np.triu(np.full((T, T), -1e30, dtype=np.float32), k=1)
+        mask = xp.triu(xp.full((T, T), -1e30, dtype=_np.float32), k=1)
         scores = scores + mask[None, None]
         shifted = scores - scores.max(axis=-1, keepdims=True)
         e = np.exp(shifted)

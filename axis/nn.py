@@ -90,6 +90,29 @@ class Module:
     def num_parameters(self) -> int:
         return sum(p.size for p in self.parameters())
 
+    def to_gpu(self) -> "Module":
+        """Move every parameter to the GPU (CuPy). The whole engine then runs
+        on the device — matmul is cuBLAS, elementwise ops run on the GPU, with
+        no per-op host round-trip."""
+        from axis import backend as _B
+        if not _B.has_cupy():
+            raise RuntimeError("CuPy is not installed — GPU engine unavailable "
+                               "(pip install cupy-cuda12x)")
+        for p in self.parameters():
+            p.data = _B.to_gpu_array(p.data)
+            p._dev = None
+        _B.set_device("gpu")
+        return self
+
+    def to_cpu(self) -> "Module":
+        """Move every parameter back to host (NumPy)."""
+        from axis import backend as _B
+        for p in self.parameters():
+            p.data = _B.to_numpy(p.data)
+            p._dev = None
+        _B.set_device("cpu")
+        return self
+
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
@@ -208,11 +231,12 @@ def _rope_cache(seq_len: int, head_dim: int, theta: float = 10000.0):
 
 def apply_rope(x: Tensor, cos: np.ndarray, sin: np.ndarray) -> Tensor:
     """x: [B, H, T, D]. Rotates pairs (x[..., :D/2], x[..., D/2:])."""
+    from axis import backend as _B
     d_half = x.shape[-1] // 2
     x1 = ops.getitem(x, (Ellipsis, slice(0, d_half)))
     x2 = ops.getitem(x, (Ellipsis, slice(d_half, None)))
-    c = Tensor(cos[None, None, : x.shape[2], :])
-    s = Tensor(sin[None, None, : x.shape[2], :])
+    c = Tensor(_B.like(x.data, cos[None, None, : x.shape[2], :]))
+    s = Tensor(_B.like(x.data, sin[None, None, : x.shape[2], :]))
     r1 = ops.sub(ops.mul(x1, c), ops.mul(x2, s))
     r2 = ops.add(ops.mul(x1, s), ops.mul(x2, c))
     return ops.cat([r1, r2], axis=-1)

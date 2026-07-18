@@ -10,6 +10,7 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #define API extern "C" __attribute__((visibility("default")))
 #define MAX_BUFS 8192
@@ -22,6 +23,7 @@ enum OpKind {
     OP_ROPE = 10, OP_SOFTMAX_CAUSAL = 11, OP_REPEAT_KV = 12, OP_RMSNORM_BWD = 13,
     OP_COLSUM = 14, OP_REPEAT_KV_BWD = 15, OP_SOFTMAX_BWD = 16, OP_SILU_BWD = 17,
     OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
+    OP_FLASH = 23,
 };
 
 typedef struct {
@@ -360,6 +362,164 @@ __global__ void k_cast_b2f(const bf16* a, float* c, long long n) {
     if (i < n) c[i] = __bfloat162float(a[i]);
 }
 
+// ── fused flash attention forward (bf16, WMMA tensor cores) ───────────────
+// One block per (b*h, query tile of BR rows). K/V stream through shared memory
+// in BC-column tiles with ONLINE softmax — probabilities never touch HBM.
+// GQA-native: kv head = h / (H/KV). Causal: tiles fully above the diagonal are
+// skipped; the diagonal tile is masked per element. fp32 accumulation.
+// q,k,v,o: [B,H|KV,T,DH] row-major bf16. lse (optional): [B*H,T] fp32.
+template <int BR, int BC>
+__global__ void k_flash_fwd(const bf16* __restrict__ q, const bf16* __restrict__ k,
+                            const bf16* __restrict__ v, bf16* __restrict__ o,
+                            float* lse, int T, int DH, int H, int KV, float scale) {
+    const int qb = blockIdx.x * BR;
+    const int bh = blockIdx.y;
+    const int b = bh / H, h = bh % H;
+    const int g = h / (H / KV);
+    const long long qoff = (long long)bh * T * DH;
+    const long long koff = ((long long)b * KV + g) * T * DH;
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    const int warp = tid >> 5, nwarp = nthr >> 5;
+
+    // padded row strides kill wmma shared-memory bank conflicts (128B rows
+    // all land on the same banks otherwise)
+    const int QLD = DH + 8;                  // bf16 rows of Q/K/V tiles
+    const int PLD = BC + 8;                  // bf16 rows of P
+    const int SLD = BC + 4;                  // fp32 rows of S
+    const int OLD = DH + 4;                  // fp32 rows of P@V result
+    extern __shared__ char smem[];
+    const int SFP = BR * ((SLD > OLD) ? SLD : OLD);
+    float* Sfp  = (float*)smem;              // scores, then P@V (union)
+    float* Oacc = Sfp + SFP;                 // BR*DH (linear access, unpadded)
+    float* mrow = Oacc + BR * DH;            // BR
+    float* lrow = mrow + BR;                 // BR
+    float* rrow = lrow + BR;                 // BR per-tile rescale
+    bf16* Qs = (bf16*)(rrow + BR);           // BR*QLD
+    bf16* Ks = Qs + BR * QLD;                // BC*QLD
+    bf16* Vs = Ks + BC * QLD;                // BC*QLD
+    bf16* Pb = Vs + BC * QLD;                // BR*PLD
+
+    const bf16 zb = __float2bfloat16(0.f);
+    // vectorized 128-bit loads: 8 bf16/thread (DH%16==0, QLD%8==0)
+    const int V8 = DH / 8, Q8 = QLD / 8;
+    const uint4 z4 = make_uint4(0, 0, 0, 0);
+    {
+        const uint4* q4 = (const uint4*)(q + qoff);
+        uint4* Qs4 = (uint4*)Qs;
+        for (int i = tid; i < BR * V8; i += nthr) {
+            int r = i / V8, j = i % V8;
+            Qs4[r * Q8 + j] = (qb + r < T) ? q4[(long long)(qb + r) * V8 + j] : z4;
+        }
+    }
+    for (int i = tid; i < BR * DH; i += nthr) Oacc[i] = 0.f;
+    if (tid < BR) { mrow[tid] = -1e30f; lrow[tid] = 0.f; }
+    __syncthreads();
+
+    const int qend = min(qb + BR - 1, T - 1);
+    const int nkt = qend / BC + 1;
+    const int RT = BR / 16, CT = BC / 16, DT_ = DH / 16;
+    const int lane = tid & 31;
+    for (int kt = 0; kt < nkt; kt++) {
+        const int kb = kt * BC;
+        const bool full = kb + BC - 1 <= qb;   // tile fully below diagonal
+        {
+            const uint4* k4 = (const uint4*)(k + koff);
+            const uint4* v4 = (const uint4*)(v + koff);
+            uint4* Ks4 = (uint4*)Ks;
+            uint4* Vs4 = (uint4*)Vs;
+            for (int i = tid; i < BC * V8; i += nthr) {
+                int r = i / V8, j = i % V8;
+                bool in = kb + r < T;
+                long long src = (long long)(kb + r) * V8 + j;
+                Ks4[r * Q8 + j] = in ? k4[src] : z4;
+                Vs4[r * Q8 + j] = in ? v4[src] : z4;
+            }
+        }
+        __syncthreads();
+        // S = Q @ K^T
+        for (int t = warp; t < RT * CT; t += nwarp) {
+            const int r0 = (t / CT) * 16, c0 = (t % CT) * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+            nvcuda::wmma::fill_fragment(acc, 0.f);
+            for (int kk = 0; kk < DH; kk += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::row_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::col_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, Qs + r0 * QLD + kk, QLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Ks + c0 * QLD + kk, QLD);
+                nvcuda::wmma::mma_sync(acc, af, bfr, acc);
+            }
+            nvcuda::wmma::store_matrix_sync(Sfp + r0 * SLD + c0, acc, SLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        // online softmax: one WARP per query row (shuffle reductions)
+        for (int r = warp; r < BR; r += nwarp) {
+            const int qg = qb + r;
+            if (qg >= T) {
+                for (int c = lane; c < BC; c += 32) Pb[r * PLD + c] = zb;
+                if (!lane) rrow[r] = 1.f;
+                continue;
+            }
+            float mo = mrow[r], mx = mo;
+            for (int c = lane; c < BC; c += 32) {
+                float s = (full || kb + c <= qg) ? Sfp[r * SLD + c] * scale : -1e30f;
+                mx = fmaxf(mx, s);
+            }
+            for (int off = 16; off; off >>= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            float sum = 0.f;
+            for (int c = lane; c < BC; c += 32) {
+                float p = (full || kb + c <= qg) ? __expf(Sfp[r * SLD + c] * scale - mx) : 0.f;
+                Pb[r * PLD + c] = __float2bfloat16(p);
+                sum += p;
+            }
+            for (int off = 16; off; off >>= 1)
+                sum += __shfl_xor_sync(0xffffffffu, sum, off);
+            if (!lane) {
+                float rescale = __expf(mo - mx);     // mo=-1e30 -> 0, no NaN
+                lrow[r] = lrow[r] * rescale + sum;
+                mrow[r] = mx;
+                rrow[r] = rescale;
+            }
+        }
+        __syncthreads();
+        // Sfp = P @ V (S already consumed — union buffer)
+        for (int t = warp; t < RT * DT_; t += nwarp) {
+            const int r0 = (t / DT_) * 16, d0 = (t % DT_) * 16;
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc;
+            nvcuda::wmma::fill_fragment(acc, 0.f);
+            for (int cc = 0; cc < BC; cc += 16) {
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, bf16, nvcuda::wmma::row_major> af;
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, bf16, nvcuda::wmma::row_major> bfr;
+                nvcuda::wmma::load_matrix_sync(af, Pb + r0 * PLD + cc, PLD);
+                nvcuda::wmma::load_matrix_sync(bfr, Vs + cc * QLD + d0, QLD);
+                nvcuda::wmma::mma_sync(acc, af, bfr, acc);
+            }
+            nvcuda::wmma::store_matrix_sync(Sfp + r0 * OLD + d0, acc, OLD, nvcuda::wmma::mem_row_major);
+        }
+        __syncthreads();
+        // fold rescale into the accumulate: O = O*rescale + P@V
+        for (int i = tid; i < BR * DH; i += nthr) {
+            int r = i / DH, d = i % DH;
+            Oacc[i] = Oacc[i] * rrow[r] + Sfp[r * OLD + d];
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < BR * DH; i += nthr) {
+        int r = i / DH;
+        if (qb + r < T)
+            o[qoff + (long long)(qb + r) * DH + i % DH] = __float2bfloat16(Oacc[i] / lrow[r]);
+    }
+    if (lse && tid < BR && qb + tid < T)
+        lse[(long long)bh * T + qb + tid] = mrow[tid] + logf(lrow[tid]);
+}
+
+static size_t flash_smem(int BR, int BC, int DH) {
+    int sld = BC + 4, old_ = DH + 4;
+    int sfp = BR * ((sld > old_) ? sld : old_);
+    return (size_t)(sfp + BR * DH + 3 * BR) * 4
+         + (size_t)(BR * (DH + 8) + 2 * BC * (DH + 8) + BR * (BC + 8)) * 2;
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 API int eng_init() {
     if (cublasCreate(&g_blas)) return 1;
@@ -367,8 +527,10 @@ API int eng_init() {
     if (cudaMalloc(&g_ws, 64 << 20)) return 3;
     if (cublasSetWorkspace(g_blas, g_ws, 64 << 20)) return 4;
     if (cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking)) return 5;
-    if (cublasSetStream(g_blas, g_stream)) return 6;
-    for (int i = 0; i < MAX_BUFS; i++) g_bufs[i] = nullptr;
+    if (cublasSetStream(g_blas, g_stream)) return 6;    // flash kernels use >48KB dynamic shared memory — opt in here (NOT inside
+    // graph capture)
+    cudaFuncSetAttribute(k_flash_fwd<64, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
+    cudaFuncSetAttribute(k_flash_fwd<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);    for (int i = 0; i < MAX_BUFS; i++) g_bufs[i] = nullptr;
     return 0;
 }
 
@@ -555,6 +717,25 @@ static int exec_op(const EngOp* op) {
         case OP_TICK:
             k_tick<<<1, 1, 0, g_stream>>>(EL(float)(A));
             break;
+        case OP_FLASH: {
+            // a=q b=k d=v c=o; m=T n=DH k=KV batch=B tb=H; sa=lse buf (0=none);
+            // alpha=scale. bf16 only; DH%16==0, DH<=128.
+            if (op->dt != 1 || op->n % 16 || op->n > 128) return 101;
+            int T_ = op->m, DH_ = op->n;
+            float* lse = op->sa > 0 ? EL(float)(g_bufs[op->sa]) : nullptr;
+            if (DH_ <= 64) {
+                dim3 grid((T_ + 63) / 64, op->batch * op->tb);
+                k_flash_fwd<64, 64><<<grid, 256, flash_smem(64, 64, DH_), g_stream>>>(
+                    CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), EL(bf16)(C), lse,
+                    T_, DH_, op->tb, op->k, op->alpha);
+            } else {
+                dim3 grid((T_ + 31) / 32, op->batch * op->tb);
+                k_flash_fwd<32, 64><<<grid, 256, flash_smem(32, 64, DH_), g_stream>>>(
+                    CEL(bf16)(A), CEL(bf16)(B), CEL(bf16)(D), EL(bf16)(C), lse,
+                    T_, DH_, op->tb, op->k, op->alpha);
+            }
+            break;
+        }
         case OP_CAST: {
             long long n = ((long long)op->m) * (op->n > 0 ? op->n : 1);
             int blocks = (int)((n + T - 1) / T);

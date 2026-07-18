@@ -17,7 +17,7 @@ import numpy as np
 (GEMM, ADD, MUL, SILU_MUL, RMSNORM, ADAMW, SCALE, COPY,
  GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
  RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD, SILU_BWD,
- EMBED, EMBED_BWD, CE, TICK, CAST) = range(23)
+ EMBED, EMBED_BWD, CE, TICK, CAST, FLASH) = range(24)
 
 
 class _EngOp(ctypes.Structure):
@@ -56,6 +56,8 @@ def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
     ADAMW: a=master(fp32) b=g(fp32) c=m d=v; tb=t-buffer (-1 folded);
            sa=bf16 param mirror (0 = none); alpha=lr beta=lr*wd gamma=eps
     CAST: a->c; tb=0 fp32->bf16, tb=1 bf16->fp32; m(*n)=count
+    FLASH: fused attention fwd (bf16): a=q b=k d=v c=o; m=T n=DH k=KV
+           batch=B tb=H; sa=lse buffer (0=none); alpha=scale
     """
     return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, oa, ob, oc,
             alpha, beta, gamma)

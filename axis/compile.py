@@ -19,17 +19,21 @@ import numpy as np
 from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL,
                          RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
-                         SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST)
+                         SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST,
+                         FLASH)
 
 
 class CompiledTransformer:
     def __init__(self, lib_path: str, cfg: dict, weights: Dict[str, np.ndarray],
                  batch: int, seq: int, lr: float = 3e-4, wd: float = 0.1,
                  eps: float = 1e-5, tf32: bool = True, recompute_attn: bool = True,
-                 dtype: str = "fp32", attn_tile: int = 256):
+                 dtype: str = "fp32", attn_tile: int = 256, attn_impl: str = "auto"):
         # recompute_attn: kept for API compat — tiled attention always
         # recomputes probs per tile in backward (flash-style memory).
+        # attn_impl: "auto" (fused flash kernel when eligible: bf16, head_dim
+        # multiple of 16, <=128), "flash", or "tiled".
         assert dtype in ("fp32", "bf16")
+        assert attn_impl in ("auto", "flash", "tiled")
         self.cfg = cfg
         self.B, self.T = batch, seq
         self.lr, self.wd = lr, wd
@@ -115,6 +119,12 @@ class CompiledTransformer:
         tiles = [(qs, min(QT, T - qs)) for qs in range(0, T, QT)]
         self.attn_tile = QT
         rep = H // KV
+        flash_ok = hf and DH % 16 == 0 and DH <= 128
+        if attn_impl == "flash" and not flash_ok:
+            raise ValueError("flash attention needs dtype=bf16 and head_dim "
+                             "multiple of 16, <=128")
+        use_flash = flash_ok if attn_impl == "auto" else attn_impl == "flash"
+        self.attn_impl = "flash" if use_flash else "tiled"
         xs = [A(N * D, isz) for _ in range(L + 1)]
         ys = [A(N * D, isz) for _ in range(L)]
         q2s = [A(N * H * DH, isz) for _ in range(L)]
@@ -167,21 +177,27 @@ class CompiledTransformer:
                 op(ROPE, a=q1, b=b_cos, d=b_sin, c=q2s[i], batch=BH, m=T, n=DH, dt=DT),
                 op(ROPE, a=k1, b=b_cos, d=b_sin, c=k2s[i], batch=BKV, m=T, n=DH, dt=DT),
             ]
-            # streaming GQA attention: batch over kv groups; per group-head j
-            # and query tile, only the causal key range
-            for j in range(rep):
-                for qs, qt in tiles:
-                    kl = qs + qt
-                    plan += [
-                        op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
-                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
-                           oa=(j * T + qs) * DH, dt=DT, alpha=scale),
-                        op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
-                           k=qs, dt=DT),
-                        op(GEMM_SB, a=b_prt, b=v1s[i], c=at, m=qt, k=kl, n=DH,
-                           batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
-                           oc=(j * T + qs) * DH, dt=DT),
-                    ]
+            if use_flash:
+                # fused kernel: scores+softmax+pv in ONE launch, probs stay
+                # on-chip (online softmax), GQA + causal handled in-kernel
+                plan += [op(FLASH, a=q2s[i], b=k2s[i], d=v1s[i], c=at,
+                            m=T, n=DH, k=KV, batch=B, tb=H, dt=DT, alpha=scale)]
+            else:
+                # streaming GQA attention: batch over kv groups; per group-head
+                # j and query tile, only the causal key range
+                for j in range(rep):
+                    for qs, qt in tiles:
+                        kl = qs + qt
+                        plan += [
+                            op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
+                               batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                               oa=(j * T + qs) * DH, dt=DT, alpha=scale),
+                            op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
+                               k=qs, dt=DT),
+                            op(GEMM_SB, a=b_prt, b=v1s[i], c=at, m=qt, k=kl, n=DH,
+                               batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
+                               oc=(j * T + qs) * DH, dt=DT),
+                        ]
             plan += [
                 op(PERM_0213, a=at, c=at2s[i], m=B, n=H, k=T, batch=DH, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=P[p + "attn.o_proj.weight"], c=o_, m=N, k=H * DH, n=D, batch=1, dt=DT),
@@ -357,7 +373,7 @@ class CompiledTransformer:
 def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
                   recompute_attn: bool = True, dtype: str = "fp32",
-                  attn_tile: int = 256) -> CompiledTransformer:
+                  attn_tile: int = 256, attn_impl: str = "auto") -> CompiledTransformer:
     """Compile an axis.nn.Transformer instance into a native training step.
 
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
@@ -376,4 +392,4 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
     return CompiledTransformer(lib_path, cfg, weights, batch, seq,
                                lr=lr, wd=wd, tf32=tf32,
                                recompute_attn=recompute_attn, dtype=dtype,
-                               attn_tile=attn_tile)
+                               attn_tile=attn_tile, attn_impl=attn_impl)

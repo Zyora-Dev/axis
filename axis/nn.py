@@ -185,9 +185,8 @@ class RMSNorm(Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        ms = ops.mean(ops.mul(x, x), axis=-1, keepdims=True)
-        inv = ops.pow(ops.add(ms, Tensor(np.float32(self.eps))), -0.5)
-        return ops.mul(ops.mul(x, inv), self.weight)
+        # Fused: one tape node, exact analytic backward (see ops.rmsnorm).
+        return ops.rmsnorm(x, self.weight, eps=self.eps)
 
 
 class LayerNorm(Module):
@@ -230,16 +229,9 @@ def _rope_cache(seq_len: int, head_dim: int, theta: float = 10000.0):
 
 
 def apply_rope(x: Tensor, cos: np.ndarray, sin: np.ndarray) -> Tensor:
-    """x: [B, H, T, D]. Rotates pairs (x[..., :D/2], x[..., D/2:])."""
-    from axis import backend as _B
-    d_half = x.shape[-1] // 2
-    x1 = ops.getitem(x, (Ellipsis, slice(0, d_half)))
-    x2 = ops.getitem(x, (Ellipsis, slice(d_half, None)))
-    c = Tensor(_B.like(x.data, cos[None, None, : x.shape[2], :]))
-    s = Tensor(_B.like(x.data, sin[None, None, : x.shape[2], :]))
-    r1 = ops.sub(ops.mul(x1, c), ops.mul(x2, s))
-    r2 = ops.add(ops.mul(x1, s), ops.mul(x2, c))
-    return ops.cat([r1, r2], axis=-1)
+    """x: [B, H, T, D]. Rotates pairs (x[..., :D/2], x[..., D/2:]).
+    Fused: one tape node with exact inverse-rotation backward (ops.rope)."""
+    return ops.rope(x, cos, sin)
 
 
 # ─── Attention (causal, GQA) ────────────────────────────────────────────────

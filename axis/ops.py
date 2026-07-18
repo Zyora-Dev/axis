@@ -382,6 +382,53 @@ def silu_mul(g: Tensor, u: Tensor) -> Tensor:
     return _make(data, (g, u), "silu_mul", backward)
 
 
+def rmsnorm(x: Tensor, weight: Tensor, eps: float = 1e-5) -> Tensor:
+    """Fused RMSNorm: x / sqrt(mean(x^2, -1) + eps) * weight.
+
+    ONE tape node with an exact analytic backward, replacing a 6-op chain
+    (mul, mean, add, pow, mul, mul) — far fewer kernel launches and tape nodes.
+    """
+    xd = x.data
+    D = xd.shape[-1]
+    ms = (xd * xd).mean(axis=-1, keepdims=True)
+    inv = (ms + _np.float32(eps)) ** -0.5          # [..., 1]
+    data = xd * inv * weight.data
+
+    def backward(g):
+        # y_i = x_i * inv * w_i ;  d inv/d x_k = -x_k inv^3 / D
+        gw_x = (g * weight.data * xd).sum(axis=-1, keepdims=True)
+        dx = g * weight.data * inv - xd * (inv ** 3) * (gw_x / D)
+        dw = _unbroadcast(g * xd * inv, weight.shape)
+        return [(x, dx.astype(_np.float32)), (weight, dw.astype(_np.float32))]
+
+    return _make(data, (x, weight), "rmsnorm", backward)
+
+
+def rope(x: Tensor, cos, sin) -> Tensor:
+    """Fused rotary position embedding on [B, H, T, D] (half-split rotate).
+
+    ONE tape node replacing ~10 ops (2 getitem, 4 mul, sub, add, cat). The
+    rotation is linear, so backward is the exact inverse rotation of the grad.
+    cos/sin: [T, D/2] arrays (host or device — moved to x's device).
+    """
+    xp = array_module(x.data)
+    T = x.shape[2]
+    d_half = x.shape[-1] // 2
+    c = xp.asarray(cos[None, None, :T, :])
+    s = xp.asarray(sin[None, None, :T, :])
+    x1 = x.data[..., :d_half]
+    x2 = x.data[..., d_half:]
+    data = xp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
+
+    def backward(g):
+        g1 = g[..., :d_half]
+        g2 = g[..., d_half:]
+        dx = xp.concatenate([g1 * c + g2 * s, -g1 * s + g2 * c], axis=-1)
+        return [(x, dx.astype(_np.float32))]
+
+    return _make(data, (x,), "rope", backward)
+
+
 def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
     """Causal attention in one op: softmax(mask(q@k^T * scale)) @ v.
 

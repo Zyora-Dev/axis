@@ -17,8 +17,8 @@ from typing import Dict
 import numpy as np
 
 from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
-                         GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
-                         RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD,
+                         GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL,
+                         RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
                          SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST)
 
 
@@ -103,18 +103,23 @@ class CompiledTransformer:
         self.b_loss = A(1)
 
         # ── per-block saved activations (dtype isz) ──
-        # NOTE: attention probs are NEVER materialized at [T,T] — attention is
-        # query-tiled (streaming): per tile of QT query rows only the causal
-        # key range [0, qs+qt) is computed (skips masked work), scratch is
-        # O(QT*T) not O(T*T), backward recomputes probs per tile.
+        # Attention is streaming (query-tiled) AND GQA-native:
+        #  - probs are NEVER materialized at [T,T]: per tile of QT query rows
+        #    only the causal key range [0, qs+qt) is computed (masked work
+        #    skipped), scratch is O(QT*T); backward recomputes probs per tile.
+        #  - k/v are NEVER repeated to H heads: GEMMs batch over kv groups
+        #    (B*KV) and address each group's `rep` query heads via offsets, so
+        #    saved k/v are KV-sized and dk/dv group-sums happen inside the
+        #    accumulating GEMMs (beta=1).
         QT = max(1, min(attn_tile, T))
         tiles = [(qs, min(QT, T - qs)) for qs in range(0, T, QT)]
         self.attn_tile = QT
+        rep = H // KV
         xs = [A(N * D, isz) for _ in range(L + 1)]
         ys = [A(N * D, isz) for _ in range(L)]
         q2s = [A(N * H * DH, isz) for _ in range(L)]
-        krs = [A(N * H * DH, isz) for _ in range(L)]
-        vrs = [A(N * H * DH, isz) for _ in range(L)]
+        k2s = [A(N * KV * DH, isz) for _ in range(L)]
+        v1s = [A(N * KV * DH, isz) for _ in range(L)]
         at2s = [A(N * H * DH, isz) for _ in range(L)]
         r1s = [A(N * D, isz) for _ in range(L)]
         zs = [A(N * D, isz) for _ in range(L)]
@@ -124,10 +129,9 @@ class CompiledTransformer:
 
         # ── shared scratch ──
         q0 = A(N * H * DH, isz); k0 = A(N * KV * DH, isz); v0 = A(N * KV * DH, isz)
-        q1 = A(N * H * DH, isz); k1 = A(N * KV * DH, isz); v1 = A(N * KV * DH, isz)
-        k2 = A(N * KV * DH, isz)
-        b_sct = A(BH * QT * T, isz)          # score tile   [BH, qt, kl]
-        b_prt = A(BH * QT * T, isz)          # probs tile
+        q1 = A(N * H * DH, isz); k1 = A(N * KV * DH, isz)
+        b_sct = A(BKV * QT * T, isz)         # score tile   [BKV, qt, kl]
+        b_prt = A(BKV * QT * T, isz)         # probs tile
         at = A(N * H * DH, isz); o_ = A(N * D, isz); mo = A(N * D, isz)
         xf = A(N * D, isz)
         logits = A(N * V, isz); dlogits = A(N * V, isz)
@@ -136,10 +140,9 @@ class CompiledTransformer:
         dz1 = A(N * D, isz); dz2 = A(N * D, isz); dz = A(N * D, isz)
         dr1b = A(N * D, isz); dr1 = A(N * D, isz)
         dat2 = A(N * H * DH, isz); dat = A(N * H * DH, isz)
-        b_dprt = A(BH * QT * T, isz)         # dprobs tile
-        b_dsct = A(BH * QT * T, isz)         # dscores tile
-        dvr = A(N * H * DH, isz)
-        dq2 = A(N * H * DH, isz); dkr = A(N * H * DH, isz)
+        b_dprt = A(BKV * QT * T, isz)        # dprobs tile
+        b_dsct = A(BKV * QT * T, isz)        # dscores tile
+        dq2 = A(N * H * DH, isz)
         dk2 = A(N * KV * DH, isz); dv1 = A(N * KV * DH, isz)
         dq1 = A(N * H * DH, isz); dk1 = A(N * KV * DH, isz)
         dq0 = A(N * H * DH, isz); dk0 = A(N * KV * DH, isz); dv0 = A(N * KV * DH, isz)
@@ -160,25 +163,25 @@ class CompiledTransformer:
                 op(GEMM_SB, a=ys[i], b=P[p + "attn.v_proj.weight"], c=v0, m=N, k=D, n=KV * DH, batch=1, dt=DT),
                 op(PERM_0213, a=q0, c=q1, m=B, n=T, k=H, batch=DH, dt=DT),
                 op(PERM_0213, a=k0, c=k1, m=B, n=T, k=KV, batch=DH, dt=DT),
-                op(PERM_0213, a=v0, c=v1, m=B, n=T, k=KV, batch=DH, dt=DT),
+                op(PERM_0213, a=v0, c=v1s[i], m=B, n=T, k=KV, batch=DH, dt=DT),
                 op(ROPE, a=q1, b=b_cos, d=b_sin, c=q2s[i], batch=BH, m=T, n=DH, dt=DT),
-                op(ROPE, a=k1, b=b_cos, d=b_sin, c=k2, batch=BKV, m=T, n=DH, dt=DT),
-                op(REPEAT_KV, a=k2, c=krs[i], batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
-                op(REPEAT_KV, a=v1, c=vrs[i], batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
+                op(ROPE, a=k1, b=b_cos, d=b_sin, c=k2s[i], batch=BKV, m=T, n=DH, dt=DT),
             ]
-            # streaming attention: per query tile, causal key range only
-            for qs, qt in tiles:
-                kl = qs + qt
-                plan += [
-                    op(GEMM_SB, a=q2s[i], b=krs[i], c=b_sct, m=qt, k=DH, n=kl,
-                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
-                       oa=qs * DH, dt=DT, alpha=scale),
-                    op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BH, m=qt, n=kl,
-                       k=qs, dt=DT),
-                    op(GEMM_SB, a=b_prt, b=vrs[i], c=at, m=qt, k=kl, n=DH,
-                       batch=BH, sa=qt * kl, sb=T * DH, sc=T * DH,
-                       oc=qs * DH, dt=DT),
-                ]
+            # streaming GQA attention: batch over kv groups; per group-head j
+            # and query tile, only the causal key range
+            for j in range(rep):
+                for qs, qt in tiles:
+                    kl = qs + qt
+                    plan += [
+                        op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
+                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                           oa=(j * T + qs) * DH, dt=DT, alpha=scale),
+                        op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
+                           k=qs, dt=DT),
+                        op(GEMM_SB, a=b_prt, b=v1s[i], c=at, m=qt, k=kl, n=DH,
+                           batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
+                           oc=(j * T + qs) * DH, dt=DT),
+                    ]
             plan += [
                 op(PERM_0213, a=at, c=at2s[i], m=B, n=H, k=T, batch=DH, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=P[p + "attn.o_proj.weight"], c=o_, m=N, k=H * DH, n=D, batch=1, dt=DT),
@@ -236,41 +239,41 @@ class CompiledTransformer:
                 op(GEMM_SB, a=dr1, b=P[p + "attn.o_proj.weight"], c=dat2, m=N, k=D, n=H * DH, batch=1, tb=1, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=dr1, c=G[p + "attn.o_proj.weight"], m=H * DH, n=D, k=N, batch=1, tb=2, dt=DTW),
                 op(PERM_0213, a=dat2, c=dat, m=B, n=T, k=H, batch=DH, dt=DT),
-                # dkr/dvr accumulate over query tiles (beta=1) — zero first
-                op(SCALE, a=dkr, c=dkr, n=N * H * DH, dt=DT, alpha=0.0),
-                op(SCALE, a=dvr, c=dvr, n=N * H * DH, dt=DT, alpha=0.0),
+                # dk/dv accumulate over group heads + query tiles (beta=1)
+                op(SCALE, a=dk2, c=dk2, n=N * KV * DH, dt=DT, alpha=0.0),
+                op(SCALE, a=dv1, c=dv1, n=N * KV * DH, dt=DT, alpha=0.0),
             ]
-            # streaming attention backward: recompute probs per tile
-            for qs, qt in tiles:
-                kl = qs + qt
-                plan += [
-                    op(GEMM_SB, a=q2s[i], b=krs[i], c=b_sct, m=qt, k=DH, n=kl,
-                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
-                       oa=qs * DH, dt=DT, alpha=scale),
-                    op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BH, m=qt, n=kl,
-                       k=qs, dt=DT),
-                    # dprobs = dat_tile @ v^T
-                    op(GEMM_SB, a=dat, b=vrs[i], c=b_dprt, m=qt, k=DH, n=kl,
-                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
-                       oa=qs * DH, dt=DT),
-                    # dv[:kl] += probs^T @ dat_tile
-                    op(GEMM_SB, a=b_prt, b=dat, c=dvr, m=kl, n=DH, k=qt,
-                       batch=BH, tb=2, sa=qt * kl, sb=T * DH, sc=T * DH,
-                       ob=qs * DH, dt=DT, beta=1.0),
-                    op(SOFTMAX_BWD, a=b_prt, b=b_dprt, c=b_dsct, batch=BH,
-                       m=qt, n=kl, dt=DT),
-                    # dq_tile = dscores @ k[:kl] * scale
-                    op(GEMM_SB, a=b_dsct, b=krs[i], c=dq2, m=qt, k=kl, n=DH,
-                       batch=BH, sa=qt * kl, sb=T * DH, sc=T * DH,
-                       oc=qs * DH, dt=DT, alpha=scale),
-                    # dk[:kl] += dscores^T @ q_tile * scale
-                    op(GEMM_SB, a=b_dsct, b=q2s[i], c=dkr, m=kl, n=DH, k=qt,
-                       batch=BH, tb=2, sa=qt * kl, sb=T * DH, sc=T * DH,
-                       ob=qs * DH, dt=DT, alpha=scale, beta=1.0),
-                ]
+            # streaming GQA attention backward: recompute probs per tile;
+            # the beta=1 GEMMs also perform the GQA group-sum for dk/dv
+            for j in range(rep):
+                for qs, qt in tiles:
+                    kl = qs + qt
+                    plan += [
+                        op(GEMM_SB, a=q2s[i], b=k2s[i], c=b_sct, m=qt, k=DH, n=kl,
+                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                           oa=(j * T + qs) * DH, dt=DT, alpha=scale),
+                        op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BKV, m=qt, n=kl,
+                           k=qs, dt=DT),
+                        # dprobs = dat_tile @ v^T
+                        op(GEMM_SB, a=dat, b=v1s[i], c=b_dprt, m=qt, k=DH, n=kl,
+                           batch=BKV, tb=1, sa=rep * T * DH, sb=T * DH, sc=qt * kl,
+                           oa=(j * T + qs) * DH, dt=DT),
+                        # dv[:kl] += probs^T @ dat_tile
+                        op(GEMM_SB, a=b_prt, b=dat, c=dv1, m=kl, n=DH, k=qt,
+                           batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
+                           ob=(j * T + qs) * DH, dt=DT, beta=1.0),
+                        op(SOFTMAX_BWD, a=b_prt, b=b_dprt, c=b_dsct, batch=BKV,
+                           m=qt, n=kl, dt=DT),
+                        # dq_tile = dscores @ k[:kl] * scale
+                        op(GEMM_SB, a=b_dsct, b=k2s[i], c=dq2, m=qt, k=kl, n=DH,
+                           batch=BKV, sa=qt * kl, sb=T * DH, sc=rep * T * DH,
+                           oc=(j * T + qs) * DH, dt=DT, alpha=scale),
+                        # dk[:kl] += dscores^T @ q_tile * scale
+                        op(GEMM_SB, a=b_dsct, b=q2s[i], c=dk2, m=kl, n=DH, k=qt,
+                           batch=BKV, tb=2, sa=qt * kl, sb=rep * T * DH, sc=T * DH,
+                           ob=(j * T + qs) * DH, dt=DT, alpha=scale, beta=1.0),
+                    ]
             plan += [
-                op(REPEAT_KV_BWD, a=dkr, c=dk2, batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
-                op(REPEAT_KV_BWD, a=dvr, c=dv1, batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
                 op(ROPE, a=dq2, b=b_cos, d=b_sin, c=dq1, batch=BH, m=T, n=DH, tb=1, dt=DT),
                 op(ROPE, a=dk2, b=b_cos, d=b_sin, c=dk1, batch=BKV, m=T, n=DH, tb=1, dt=DT),
                 op(PERM_0213, a=dq1, c=dq0, m=B, n=H, k=T, batch=DH, dt=DT),

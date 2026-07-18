@@ -90,18 +90,43 @@ def parity():
     ok &= check("fp32 tile=T  (1 tile) ", "fp32", T, 1e-4, 1e-3)
     ok &= check("fp32 tile=13 (ragged) ", "fp32", 13, 1e-4, 1e-3)
     ok &= check("bf16 tile=8  (4 tiles)", "bf16", 8, 5e-2, 1.5e-1)
+
+    # GQA edge cases: MHA (KV=H, rep=1) and MQA (KV=1, max rep)
+    for kv2, label in ((H, "fp32 MHA KV=H tile=8 "), (1, "fp32 MQA KV=1 tile=8 ")):
+        axis.manual_seed(2)
+        m3 = nn.Transformer(vocab_size=V, dim=D, n_layers=2, n_heads=H,
+                            n_kv_heads=kv2, mlp_hidden=MLP, max_seq_len=T,
+                            tie_embeddings=True)
+        w3 = {n: p.data.copy() for n, p in m3.named_parameters()}
+        lt = m3.loss(Tensor(inp), Tensor(tgt))
+        rl = float(lt.data)
+        lt.backward()
+        rg = {n: p.grad.copy() for n, p in m3.named_parameters()}
+        cfg3 = dict(vocab_size=V, dim=D, n_layers=2, n_heads=H, n_kv_heads=kv2,
+                    mlp_hidden=MLP, tie_embeddings=True)
+        ct = CompiledTransformer("/root/libaxeng.so", cfg3, w3, B, T,
+                                 tf32=False, dtype="fp32", attn_tile=8)
+        gl = ct.step(inp, tgt, t=1)
+        gg = ct.grads()
+        worst = max(np.abs(gg[nm] - g).max() / (np.abs(g).max() + 1e-9)
+                    for nm, g in rg.items())
+        okx = abs(rl - gl) < 1e-4 and worst < 1e-3
+        print(f"{label}: loss Δ {abs(rl-gl):.2e} | worst grad rel {worst:.2e} "
+              f"-> {'PASS' if okx else 'FAIL'}", flush=True)
+        ok &= okx
     print(f"\nSTREAMING ATTENTION PARITY: {'PASS' if ok else 'FAIL'}", flush=True)
 
 
 @app.function(image=image, gpu="A100-80GB", timeout=3600, single_use_containers=True)
-def bench(mode: str):
-    """mode: torch | bf16 | bf16-full (tile=T, no causal skipping — ablation)."""
+def bench(mode: str, seq: int = 2048, bsz: int = 4):
+    """mode: torch | bf16 | bf16-<tile>. seq/bsz: shape (tokens/step held at 8192)."""
     import subprocess, sys, time
     import numpy as np
     sys.path.insert(0, "/root")
-    N = BB * BT
+    BT_, BB_ = seq, bsz
+    N = BB_ * BT_
     rng = np.random.default_rng(1)
-    toks = rng.integers(0, BV, size=(BB, BT + 1)).astype(np.int64)
+    toks = rng.integers(0, BV, size=(BB_, BT_ + 1)).astype(np.int64)
     inp, tgt = toks[:, :-1], toks[:, 1:]
 
     def used_mb():
@@ -161,7 +186,7 @@ def bench(mode: str):
                 s.norm = TRms(BD)
                 half = DH // 2
                 fr = 1.0 / (10000.0 ** (torch.arange(half) / half))
-                ang = torch.outer(torch.arange(BT), fr)
+                ang = torch.outer(torch.arange(BT_), fr)
                 s.register_buffer("cos", ang.cos()[None, None])
                 s.register_buffer("sin", ang.sin()[None, None])
             def forward(s, ids):
@@ -190,14 +215,14 @@ def bench(mode: str):
             step()
         torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) / 5 * 1000
-        print(f"torch bf16-autocast+SDPA: {ms:7.0f} ms/step | {N/(ms/1000):7.0f} tok/s "
+        print(f"torch bf16 seq{BT_} b{BB_}: {ms:7.0f} ms/step | {N/(ms/1000):7.0f} tok/s "
               f"| mem {used_mb()} MiB", flush=True)
-        return ("torch bf16-autocast", ms, N / (ms / 1000), used_mb())
+        return (f"torch bf16 seq{BT_} b{BB_}", ms, N / (ms / 1000), used_mb())
 
     # ---- Axis engine, bf16 ----
     _compile_runtime()
     from axis.compile import CompiledTransformer
-    tile = BT if mode == "bf16-full" else int(mode.split("-")[1]) if "-" in mode else 256
+    tile = int(mode.split("-")[1]) if "-" in mode else 256
     shapes = {"embed.weight": (BV, BD), "norm.weight": (BD,)}
     DH = BD // BH
     for i in range(BL):
@@ -216,7 +241,7 @@ def bench(mode: str):
          for nm, sh in shapes.items()}
     cfg = dict(vocab_size=BV, dim=BD, n_layers=BL, n_heads=BH, n_kv_heads=BKV,
                mlp_hidden=BMLP, tie_embeddings=True)
-    ct = CompiledTransformer("/root/libaxeng.so", cfg, w, BB, BT,
+    ct = CompiledTransformer("/root/libaxeng.so", cfg, w, BB_, BT_,
                              tf32=True, dtype="bf16", attn_tile=tile)
     losses = [round(ct.step(inp, tgt), 3) for _ in range(2)]
     ct.capture()
@@ -225,7 +250,7 @@ def bench(mode: str):
     for _ in range(5):
         ct.replay_step(inp, tgt)
     ms = (time.perf_counter() - t0) / 5 * 1000
-    label = f"axis bf16 tile={tile}"
+    label = f"axis bf16 t{tile} seq{BT_} b{BB_}"
     print(f"{label}: {ms:7.0f} ms/step | {N/(ms/1000):7.0f} tok/s "
           f"| mem {used_mb()} MiB | first losses {losses}", flush=True)
     return (label, ms, N / (ms / 1000), used_mb())
@@ -234,11 +259,18 @@ def bench(mode: str):
 @app.local_entrypoint()
 def main():
     import os
-    if os.environ.get("AXIS_TILE_SWEEP"):
+    if os.environ.get("AXIS_LONGSEQ"):
+        # tokens/step held at 8192 across seq lengths
+        rows = [bench.remote(m, seq=s, bsz=b)
+                for s, b in ((4096, 2), (8192, 1)) for m in ("torch", "bf16")]
+        title = "long-seq scaling (8192 tok/step)"
+    elif os.environ.get("AXIS_TILE_SWEEP"):
         rows = [bench.remote(m) for m in ("bf16-128", "bf16-512", "bf16-1024")]
+        title = "tile sweep, seq 2048 batch 4"
     else:
         parity.remote()
         rows = [bench.remote(m) for m in ("torch", "bf16")]
-    print("\n== 1B-class, seq 2048, batch 4 ==")
+        title = "seq 2048, batch 4"
+    print(f"\n== 1B-class, {title} ==")
     for name, ms, tps, mem in rows:
-        print(f"{name:24s} {ms:7.0f} ms/step  {tps:8,.0f} tok/s  {mem:6d} MiB")
+        print(f"{name:28s} {ms:7.0f} ms/step  {tps:8,.0f} tok/s  {mem:6d} MiB")

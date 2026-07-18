@@ -36,6 +36,20 @@ def get_rng() -> np.random.Generator:
 
 _grad_enabled = threading.local()
 
+# fp16 storage mode (AMP). When enabled, float16 arrays flow through the
+# engine unchanged (params/activations live in fp16); default (off) upcasts
+# any float16 to float32 — the reference behavior.
+_FP16_MODE = False
+
+
+def set_fp16_mode(flag: bool) -> None:
+    global _FP16_MODE
+    _FP16_MODE = bool(flag)
+
+
+def fp16_mode() -> bool:
+    return _FP16_MODE
+
 
 def is_grad_enabled() -> bool:
     return getattr(_grad_enabled, "value", True)
@@ -80,7 +94,9 @@ class Tensor:
             arr = data                       # keep on GPU
         else:
             arr = np.asarray(data)
-        if arr.dtype in (np.float64, np.float16):
+        if arr.dtype == np.float64:
+            arr = arr.astype(np.float32)
+        elif arr.dtype == np.float16 and not _FP16_MODE:
             arr = arr.astype(np.float32)
         elif arr.dtype in (np.int32, np.int8, np.uint8, np.int16):
             arr = arr.astype(np.int64)

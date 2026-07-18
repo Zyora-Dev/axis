@@ -31,8 +31,13 @@ class AdamW:
         self.eps = eps
         self.weight_decay = weight_decay
         self.t = 0
-        self._m = [array_module(p.data).zeros_like(p.data) for p in self.params]
-        self._v = [array_module(p.data).zeros_like(p.data) for p in self.params]
+        self._m = [array_module(p.data).zeros_like(p.data, dtype=np.float32) for p in self.params]
+        self._v = [array_module(p.data).zeros_like(p.data, dtype=np.float32) for p in self.params]
+        # fp32 master weights for fp16-stored params (AMP): the update runs in
+        # fp32 and is written back to fp16 storage — no drift from repeated
+        # low-precision accumulation.
+        self._master = [p.data.astype(np.float32) if p.data.dtype == np.float16 else None
+                        for p in self.params]
 
     def step(self) -> None:
         self.t += 1
@@ -43,14 +48,19 @@ class AdamW:
             if p.grad is None:
                 continue
             g = p.grad
+            if g.dtype == np.float16:
+                g = g.astype(np.float32)
             self._m[i] = b1 * self._m[i] + (1.0 - b1) * g
             self._v[i] = b2 * self._v[i] + (1.0 - b2) * (g * g)
             m_hat = self._m[i] / bc1
             v_hat = self._v[i] / bc2
+            target = self._master[i] if self._master[i] is not None else p.data
             # Decoupled weight decay (applied directly to weights).
             if self.weight_decay > 0.0:
-                p.data *= (1.0 - self.lr * self.weight_decay)
-            p.data -= self.lr * m_hat / (array_module(v_hat).sqrt(v_hat) + self.eps)
+                target *= (1.0 - self.lr * self.weight_decay)
+            target -= self.lr * m_hat / (array_module(v_hat).sqrt(v_hat) + self.eps)
+            if self._master[i] is not None:
+                p.data = target.astype(np.float16)   # write back to fp16 storage
             accel.invalidate(p)  # weights changed in place — drop stale GPU cache
 
     def zero_grad(self) -> None:
@@ -104,6 +114,63 @@ def clip_grad_norm(params: Iterable[Parameter], max_norm: float) -> float:
         for p in params:
             p.grad *= scale
     return total
+
+
+class GradScaler:
+    """Dynamic loss scaling for fp16 training (AMP).
+
+    Scale the loss before backward so small gradients don't underflow fp16;
+    unscale before the optimizer step; skip the step and halve the scale on
+    inf/nan; slowly grow the scale when stable. Mirrors torch.cuda.amp.
+
+        scaler = GradScaler()
+        loss = model.loss(x, y)
+        scaler.scale(loss).backward()
+        scaler.step(opt)        # unscales, checks finite, steps or skips
+        opt.zero_grad()
+    """
+
+    def __init__(self, init_scale: float = 2.0 ** 14, growth_factor: float = 2.0,
+                 backoff_factor: float = 0.5, growth_interval: int = 200):
+        self.scale_val = float(init_scale)
+        self.growth = growth_factor
+        self.backoff = backoff_factor
+        self.interval = int(growth_interval)
+        self._good_steps = 0
+
+    def scale(self, loss):
+        from axis.tensor import Tensor
+        return loss * Tensor(np.float32(self.scale_val))
+
+    def step(self, optimizer) -> bool:
+        """Unscale grads; if all finite, optimizer.step() and return True,
+        else skip and shrink the scale."""
+        params = [p for p in optimizer.params if p.grad is not None]
+        inv = 1.0 / self.scale_val
+        # Unscale on-device and accumulate ONE scalar (sum of grad-sums): any
+        # inf/nan makes the total non-finite. Exactly one host sync — checking
+        # isfinite().all() per param would sync ~100x per step (slow).
+        total = None
+        for p in params:
+            g = p.grad.astype(np.float32) * inv
+            p.grad = g
+            s = g.sum()
+            total = s if total is None else total + s
+        finite = True
+        if total is not None:
+            xp = array_module(total)
+            finite = bool(xp.isfinite(total))
+        if finite:
+            optimizer.step()
+            self._good_steps += 1
+            if self._good_steps % self.interval == 0:
+                self.scale_val *= self.growth
+        else:
+            self.scale_val = max(self.scale_val * self.backoff, 1.0)
+            self._good_steps = 0
+            for p in params:      # drop the bad grads
+                p.grad = None
+        return finite
 
 
 class CosineWithWarmup:

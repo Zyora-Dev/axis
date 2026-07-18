@@ -90,16 +90,24 @@ class Module:
     def num_parameters(self) -> int:
         return sum(p.size for p in self.parameters())
 
-    def to_gpu(self) -> "Module":
-        """Move every parameter to the GPU (CuPy). The whole engine then runs
-        on the device — matmul is cuBLAS, elementwise ops run on the GPU, with
-        no per-op host round-trip."""
+    def to_gpu(self, fp16: bool = False) -> "Module":
+        """Move every parameter to the GPU (CuPy). With `fp16=True`, parameters
+        are STORED in float16 (AMP): matmuls run on fp16 tensor cores with no
+        per-op casts; norms/softmax/CE still compute in fp32 internally. Use
+        optim.AdamW (keeps fp32 master weights automatically) and
+        optim.GradScaler for loss scaling."""
         from axis import backend as _B
+        from axis.tensor import set_fp16_mode as _set_fp16
         if not _B.has_cupy():
             raise RuntimeError("CuPy is not installed — GPU engine unavailable "
                                "(pip install cupy-cuda12x)")
+        if fp16:
+            _set_fp16(True)
         for p in self.parameters():
-            p.data = _B.to_gpu_array(p.data)
+            arr = _B.to_gpu_array(p.data)
+            if fp16 and arr.dtype == np.float32:
+                arr = arr.astype(np.float16)
+            p.data = arr
             p._dev = None
         _B.set_device("gpu")
         return self

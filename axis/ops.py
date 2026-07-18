@@ -340,6 +340,8 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
     xp = array_module(logits.data)
     t = xp.asarray(targets.data).astype(_np.int64).reshape(-1)
     x = logits.data.reshape(-1, logits.shape[-1])
+    if x.dtype == _np.float16:      # CE always in fp32 (AMP practice)
+        x = x.astype(_np.float32)
     valid = t != ignore_index
     n_valid = int(valid.sum())
     if n_valid == 0:
@@ -359,7 +361,7 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
         p = xp.exp(logp)
         p[rows, safe_t] -= 1.0
         p *= (valid[:, None] / n_valid)
-        return [(logits, (g * p).reshape(logits.shape).astype(_np.float32))]
+        return [(logits, (g * p).reshape(logits.shape).astype(logits.data.dtype))]
 
     return _make(data, (logits,), "cross_entropy", backward)
 
@@ -368,7 +370,9 @@ def cross_entropy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> 
 
 
 def silu_mul(g: Tensor, u: Tensor) -> Tensor:
-    """Fused silu(g) * u — the SwiGLU inner product."""
+    """Fused silu(g) * u — the SwiGLU inner product. Computed in the storage
+    dtype: fp16 sigmoid is safe (exp overflow/underflow saturate to the exact
+    limits 0/1), so no fp32 copy is needed."""
     sig = 1.0 / (1.0 + np.exp(-g.data))
     gpu = accel.silu_mul(g.data, u.data)
     data = gpu if gpu is not None else (g.data * sig) * u.data
@@ -385,21 +389,24 @@ def silu_mul(g: Tensor, u: Tensor) -> Tensor:
 def rmsnorm(x: Tensor, weight: Tensor, eps: float = 1e-5) -> Tensor:
     """Fused RMSNorm: x / sqrt(mean(x^2, -1) + eps) * weight.
 
-    ONE tape node with an exact analytic backward, replacing a 6-op chain
-    (mul, mean, add, pow, mul, mul) — far fewer kernel launches and tape nodes.
+    ONE tape node with an exact analytic backward. Precision-critical
+    REDUCTIONS accumulate in fp32 (dtype= on mean/sum — no fp32 copy of x is
+    materialized), storage stays in the input dtype (fp16 under AMP).
     """
+    dt = x.data.dtype
     xd = x.data
+    wd = weight.data
     D = xd.shape[-1]
-    ms = (xd * xd).mean(axis=-1, keepdims=True)
-    inv = (ms + _np.float32(eps)) ** -0.5          # [..., 1]
-    data = xd * inv * weight.data
+    ms = (xd * xd).mean(axis=-1, keepdims=True, dtype=_np.float32)
+    inv = (ms + _np.float32(eps)) ** -0.5          # [..., 1] fp32, tiny
+    inv_dt = inv.astype(dt)
+    data = xd * inv_dt * wd
 
     def backward(g):
-        # y_i = x_i * inv * w_i ;  d inv/d x_k = -x_k inv^3 / D
-        gw_x = (g * weight.data * xd).sum(axis=-1, keepdims=True)
-        dx = g * weight.data * inv - xd * (inv ** 3) * (gw_x / D)
-        dw = _unbroadcast(g * xd * inv, weight.shape)
-        return [(x, dx.astype(_np.float32)), (weight, dw.astype(_np.float32))]
+        gw_x = (g * wd * xd).sum(axis=-1, keepdims=True, dtype=_np.float32)
+        dx = g * wd * inv_dt - xd * ((inv ** 3) * (gw_x / D)).astype(dt)
+        dw = _unbroadcast((g * xd * inv_dt).astype(_np.float32), weight.shape)
+        return [(x, dx.astype(dt)), (weight, dw.astype(wd.dtype))]
 
     return _make(data, (x, weight), "rmsnorm", backward)
 
@@ -412,10 +419,11 @@ def rope(x: Tensor, cos, sin) -> Tensor:
     cos/sin: [T, D/2] arrays (host or device — moved to x's device).
     """
     xp = array_module(x.data)
+    dt = x.data.dtype
     T = x.shape[2]
     d_half = x.shape[-1] // 2
-    c = xp.asarray(cos[None, None, :T, :])
-    s = xp.asarray(sin[None, None, :T, :])
+    c = xp.asarray(cos[None, None, :T, :]).astype(dt)   # rotation coeffs are
+    s = xp.asarray(sin[None, None, :T, :]).astype(dt)   # bounded — fp16-safe
     x1 = x.data[..., :d_half]
     x2 = x.data[..., d_half:]
     data = xp.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
@@ -424,7 +432,7 @@ def rope(x: Tensor, cos, sin) -> Tensor:
         g1 = g[..., :d_half]
         g2 = g[..., d_half:]
         dx = xp.concatenate([g1 * c + g2 * s, -g1 * s + g2 * c], axis=-1)
-        return [(x, dx.astype(_np.float32))]
+        return [(x, dx.astype(dt))]
 
     return _make(data, (x,), "rope", backward)
 
@@ -439,15 +447,21 @@ def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Ten
     one extra matmul + softmax in backward.
     """
     B, H, T, D = q.shape
+    dt = q.data.dtype
 
     def _probs(qd, kd):
         xp = array_module(qd)
-        scores = _mm(qd, np.ascontiguousarray(np.swapaxes(kd, -1, -2))) * scale
-        mask = xp.triu(xp.full((T, T), -1e30, dtype=_np.float32), k=1)
+        # matmul in storage dtype (fp16 tensor cores under AMP); softmax is
+        # shift-stabilized in the storage dtype with fp32-ACCUMULATED sum —
+        # post-shift values are ≤ 0 so exp ≤ 1 (fp16-safe), no fp32 copy of
+        # the [B,H,T,T] scores is materialized.
+        scores = _mm(qd, np.ascontiguousarray(np.swapaxes(kd, -1, -2))) * dt.type(scale)
+        mask = xp.triu(xp.full((T, T), -1e4 if dt == _np.float16 else -1e30, dtype=dt), k=1)
         scores = scores + mask[None, None]
         shifted = scores - scores.max(axis=-1, keepdims=True)
         e = np.exp(shifted)
-        return (e / e.sum(axis=-1, keepdims=True)).astype(_np.float32)
+        denom = e.sum(axis=-1, keepdims=True, dtype=_np.float32)
+        return (e / denom.astype(dt)) if dt == _np.float16 else (e / denom).astype(dt)
 
     fused = accel.fused_causal_attention(q.data, k.data, v.data, scale)
     if fused is not None:
@@ -463,10 +477,10 @@ def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Ten
         dv = _mm(p_t, grad)
         # dP = dO @ V^T ; softmax backward: dS = P * (dP - sum(dP*P))
         dp = _mm(grad, np.ascontiguousarray(np.swapaxes(v.data, -1, -2)))
-        ds = probs * (dp - (dp * probs).sum(axis=-1, keepdims=True))
+        ds = (probs * (dp - (dp * probs).sum(axis=-1, keepdims=True))).astype(dt)
         # dQ = dS @ K * scale ; dK = dS^T @ Q * scale
         dq = _mm(ds, k.data) * scale
         dk = _mm(np.ascontiguousarray(np.swapaxes(ds, -1, -2)), q.data) * scale
-        return [(q, dq.astype(np.float32)), (k, dk.astype(np.float32)), (v, dv.astype(np.float32))]
+        return [(q, dq.astype(dt)), (k, dk.astype(dt)), (v, dv.astype(dt))]
 
     return _make(data, (q, k, v), "fused_causal_attention", backward)

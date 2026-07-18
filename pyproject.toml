@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axis-ml"
-version = "0.12.1"
+version = "0.13.0"
 description = "Axis — India's first proprietary AI training & fine-tuning framework, by Zyora Labs"
 readme = "README.md"
 requires-python = ">=3.10"

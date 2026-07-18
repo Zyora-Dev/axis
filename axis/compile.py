@@ -27,11 +27,19 @@ class CompiledTransformer:
     def __init__(self, lib_path: str, cfg: dict, weights: Dict[str, np.ndarray],
                  batch: int, seq: int, lr: float = 3e-4, wd: float = 0.1,
                  eps: float = 1e-5, tf32: bool = True, recompute_attn: bool = True,
-                 dtype: str = "fp32", attn_tile: int = 256, attn_impl: str = "auto"):
+                 dtype: str = "fp32", attn_tile: int = 256, attn_impl: str = "auto",
+                 lora_r: int = 0, lora_alpha: float = 16.0,
+                 lora_targets=("q_proj", "k_proj", "v_proj", "o_proj",
+                               "gate_proj", "up_proj", "down_proj")):
         # recompute_attn: kept for API compat — tiled attention always
         # recomputes probs per tile in backward (flash-style memory).
         # attn_impl: "auto" (fused flash kernel when eligible: bf16, head_dim
         # multiple of 16, <=128), "flash", or "tiled".
+        # lora_r > 0: LoRA fine-tuning — base weights FROZEN (no grads, no
+        # optimizer state, no fp32 masters in bf16 mode); trainable params are
+        # the adapters only: W_eff = W + (alpha/r) * A @ B (A [in,r], B [r,out],
+        # matching axis.lora). Adapter weights read from `weights` when present
+        # (keys "...lora_a"/"...lora_b"), else initialized (A random, B zero).
         assert dtype in ("fp32", "bf16")
         assert attn_impl in ("auto", "flash", "tiled")
         self.cfg = cfg
@@ -54,6 +62,14 @@ class CompiledTransformer:
         BH, BKV = B * H, B * KV
         scale = 1.0 / np.sqrt(DH)
         self.N, self.V = N, V
+        lora = lora_r > 0
+        sc_l = float(lora_alpha) / lora_r if lora else 0.0
+        self.lora_r = lora_r
+        lin_geom = {"attn.q_proj": (D, H * DH), "attn.k_proj": (D, KV * DH),
+                    "attn.v_proj": (D, KV * DH), "attn.o_proj": (H * DH, D),
+                    "mlp.gate_proj": (D, MLP), "mlp.up_proj": (D, MLP),
+                    "mlp.down_proj": (MLP, D)}
+        lset = set(lora_targets) if lora else set()
 
         eng = Engine(lib_path)
         eng.set_tf32(tf32)
@@ -68,26 +84,61 @@ class CompiledTransformer:
         b_sin = eng.new_tensor(np.sin(ang).astype(np.float32))
 
         # ── params ──
-        # masters: fp32 (uploaded). In bf16 mode each param also has a bf16
-        # mirror used by ALL compute; AdamW updates master then refreshes the
-        # mirror. Grads: fp32 always (GemmEx bf16-in/fp32-out).
-        self.pnames = ["embed.weight"]
+        # Trainable params: fp32 masters (uploaded) + fp32 grads + m/v; in bf16
+        # mode also a bf16 mirror used by ALL compute (AdamW updates master
+        # then refreshes the mirror). Frozen base weights (LoRA mode): compute
+        # view only — no masters/grads/optimizer state.
+        base_names = ["embed.weight"]
         for i in range(L):
             p = f"blocks.{i}."
-            self.pnames += [p + "attn_norm.weight", p + "attn.q_proj.weight",
-                            p + "attn.k_proj.weight", p + "attn.v_proj.weight",
-                            p + "attn.o_proj.weight", p + "mlp_norm.weight",
-                            p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight",
-                            p + "mlp.down_proj.weight"]
-        self.pnames.append("norm.weight")
+            base_names += [p + "attn_norm.weight", p + "attn.q_proj.weight",
+                           p + "attn.k_proj.weight", p + "attn.v_proj.weight",
+                           p + "attn.o_proj.weight", p + "mlp_norm.weight",
+                           p + "mlp.gate_proj.weight", p + "mlp.up_proj.weight",
+                           p + "mlp.down_proj.weight"]
+        base_names.append("norm.weight")
         if not tied:
-            self.pnames.append("lm_head.weight")
-        self.shapes = {nm: weights[nm].shape for nm in self.pnames}
+            base_names.append("lm_head.weight")
+        anames = []
+        if lora:
+            for i in range(L):
+                for pref in lin_geom:
+                    if pref.split(".")[-1] in lset:
+                        anames += [f"blocks.{i}.{pref}.lora_a",
+                                   f"blocks.{i}.{pref}.lora_b"]
+        self.pnames = anames if lora else base_names       # TRAINABLE params
         self.master, self.gbuf, mb, vb = {}, {}, {}, {}
         P = {}                              # compute-view of each param
         cast_in = []
+        if lora:
+            # frozen base: bf16 via ONE shared fp32 staging buffer (no
+            # persistent masters — big memory win), or plain fp32 buffers
+            if hf:
+                stage = A(max(int(np.prod(weights[nm].shape)) for nm in base_names))
+                for nm in base_names:
+                    w = np.ascontiguousarray(weights[nm], dtype=np.float32)
+                    P[nm] = A(w.size, isz)
+                    eng.upload(stage, w.reshape(-1))
+                    eng.run([op(CAST, a=stage, c=P[nm], m=w.size, tb=0)])
+            else:
+                for nm in base_names:
+                    P[nm] = eng.new_tensor(
+                        np.ascontiguousarray(weights[nm], dtype=np.float32))
+            rng_l = np.random.default_rng(0)
+            src = {}
+            for i in range(L):
+                for pref, (fin, fout) in lin_geom.items():
+                    if pref.split(".")[-1] in lset:
+                        ka, kb = f"blocks.{i}.{pref}.lora_a", f"blocks.{i}.{pref}.lora_b"
+                        src[ka] = weights[ka] if ka in weights else \
+                            (rng_l.standard_normal((fin, lora_r)) / np.sqrt(lora_r)).astype(np.float32)
+                        src[kb] = weights[kb] if kb in weights else \
+                            np.zeros((lora_r, fout), dtype=np.float32)
+        else:
+            src = weights
+        self.shapes = {nm: src[nm].shape for nm in self.pnames}
         for nm in self.pnames:
-            w = np.ascontiguousarray(weights[nm], dtype=np.float32)
+            w = np.ascontiguousarray(src[nm], dtype=np.float32)
             self.master[nm] = eng.new_tensor(w)
             self.gbuf[nm] = A(w.size)                       # fp32 grads
             mb[nm] = eng.new_tensor(np.zeros_like(w))
@@ -165,9 +216,43 @@ class CompiledTransformer:
             # fp32; CAST back to the bf16 dq2/dk2/dv1 afterwards)
             bD = A(N * H)
             dqf = A(N * H * DH); dkf = A(N * KV * DH); dvf = A(N * KV * DH)
+        if lora:
+            u_l = {}                        # (i, pref) -> saved x@A [N, r]
+            for i in range(L):
+                for pref in lin_geom:
+                    if pref.split(".")[-1] in lset:
+                        u_l[(i, pref)] = A(N * lora_r, isz)
+            t1 = A(N * lora_r, isz)         # g @ B^T scratch
 
         G = self.gbuf
         eps_n = eps
+
+        def lin_f(x, i, pref, y):
+            """y = x@W (+ sc_l*(x@A)@B accumulated, u saved for backward)"""
+            fin, fout = lin_geom[pref]
+            key = f"blocks.{i}.{pref}"
+            o_ = [op(GEMM_SB, a=x, b=P[key + ".weight"], c=y, m=N, k=fin, n=fout, batch=1, dt=DT)]
+            if lora and pref.split(".")[-1] in lset:
+                u = u_l[(i, pref)]
+                o_ += [op(GEMM_SB, a=x, b=P[key + ".lora_a"], c=u, m=N, k=fin, n=lora_r, batch=1, dt=DT),
+                       op(GEMM_SB, a=u, b=P[key + ".lora_b"], c=y, m=N, k=lora_r, n=fout, batch=1, dt=DT, alpha=sc_l, beta=1.0)]
+            return o_
+
+        def lin_b(g, x, i, pref, dx):
+            """dx = g@W_eff^T; grads: base dW (full) or dA/dB (LoRA)"""
+            fin, fout = lin_geom[pref]
+            key = f"blocks.{i}.{pref}"
+            o_ = [op(GEMM_SB, a=g, b=P[key + ".weight"], c=dx, m=N, k=fout, n=fin, batch=1, tb=1, dt=DT)]
+            if not lora:
+                o_ += [op(GEMM_SB, a=x, b=g, c=G[key + ".weight"], m=fin, n=fout, k=N, batch=1, tb=2, dt=DTW)]
+            elif pref.split(".")[-1] in lset:
+                u = u_l[(i, pref)]
+                o_ += [op(GEMM_SB, a=g, b=P[key + ".lora_b"], c=t1, m=N, k=fout, n=lora_r, batch=1, tb=1, dt=DT),
+                       op(GEMM_SB, a=t1, b=P[key + ".lora_a"], c=dx, m=N, k=lora_r, n=fin, batch=1, tb=1, dt=DT, alpha=sc_l, beta=1.0),
+                       op(GEMM_SB, a=x, b=t1, c=G[key + ".lora_a"], m=fin, n=lora_r, k=N, batch=1, tb=2, dt=DTW, alpha=sc_l),
+                       op(GEMM_SB, a=u, b=g, c=G[key + ".lora_b"], m=lora_r, n=fout, k=N, batch=1, tb=2, dt=DTW, alpha=sc_l)]
+            return o_
+
         plan = [op(EMBED, a=P["embed.weight"], b=self.b_ids, c=xs[0], m=N, n=D, dt=DT)]
 
         # ── forward blocks ──
@@ -175,9 +260,11 @@ class CompiledTransformer:
             p = f"blocks.{i}."
             plan += [
                 op(RMSNORM, a=xs[i], b=P[p + "attn_norm.weight"], c=ys[i], m=N, n=D, dt=DT, alpha=eps_n),
-                op(GEMM_SB, a=ys[i], b=P[p + "attn.q_proj.weight"], c=q0, m=N, k=D, n=H * DH, batch=1, dt=DT),
-                op(GEMM_SB, a=ys[i], b=P[p + "attn.k_proj.weight"], c=k0, m=N, k=D, n=KV * DH, batch=1, dt=DT),
-                op(GEMM_SB, a=ys[i], b=P[p + "attn.v_proj.weight"], c=v0, m=N, k=D, n=KV * DH, batch=1, dt=DT),
+            ]
+            plan += lin_f(ys[i], i, "attn.q_proj", q0)
+            plan += lin_f(ys[i], i, "attn.k_proj", k0)
+            plan += lin_f(ys[i], i, "attn.v_proj", v0)
+            plan += [
                 op(PERM_0213, a=q0, c=q1, m=B, n=T, k=H, batch=DH, dt=DT),
                 op(PERM_0213, a=k0, c=k1, m=B, n=T, k=KV, batch=DH, dt=DT),
                 op(PERM_0213, a=v0, c=v1s[i], m=B, n=T, k=KV, batch=DH, dt=DT),
@@ -209,15 +296,17 @@ class CompiledTransformer:
                         ]
             plan += [
                 op(PERM_0213, a=at, c=at2s[i], m=B, n=H, k=T, batch=DH, dt=DT),
-                op(GEMM_SB, a=at2s[i], b=P[p + "attn.o_proj.weight"], c=o_, m=N, k=H * DH, n=D, batch=1, dt=DT),
+            ]
+            plan += lin_f(at2s[i], i, "attn.o_proj", o_)
+            plan += [
                 op(ADD, a=xs[i], b=o_, c=r1s[i], n=N * D, dt=DT),
                 op(RMSNORM, a=r1s[i], b=P[p + "mlp_norm.weight"], c=zs[i], m=N, n=D, dt=DT, alpha=eps_n),
-                op(GEMM_SB, a=zs[i], b=P[p + "mlp.gate_proj.weight"], c=gs[i], m=N, k=D, n=MLP, batch=1, dt=DT),
-                op(GEMM_SB, a=zs[i], b=P[p + "mlp.up_proj.weight"], c=us[i], m=N, k=D, n=MLP, batch=1, dt=DT),
-                op(SILU_MUL, a=gs[i], b=us[i], c=hs[i], n=N * MLP, dt=DT),
-                op(GEMM_SB, a=hs[i], b=P[p + "mlp.down_proj.weight"], c=mo, m=N, k=MLP, n=D, batch=1, dt=DT),
-                op(ADD, a=r1s[i], b=mo, c=xs[i + 1], n=N * D, dt=DT),
             ]
+            plan += lin_f(zs[i], i, "mlp.gate_proj", gs[i])
+            plan += lin_f(zs[i], i, "mlp.up_proj", us[i])
+            plan += [op(SILU_MUL, a=gs[i], b=us[i], c=hs[i], n=N * MLP, dt=DT)]
+            plan += lin_f(hs[i], i, "mlp.down_proj", mo)
+            plan += [op(ADD, a=r1s[i], b=mo, c=xs[i + 1], n=N * D, dt=DT)]
 
         # ── head + CE ──
         lm_w = P["embed.weight"] if tied else P["lm_head.weight"]
@@ -232,37 +321,33 @@ class CompiledTransformer:
 
         # ── head backward ──
         if tied:
-            plan += [
-                op(GEMM_SB, a=dlogits, b=lm_w, c=dxf, m=N, k=V, n=D, batch=1, tb=0, dt=DT),
-                op(GEMM_SB, a=dlogits, b=xf, c=G["embed.weight"], m=V, n=D, k=N, batch=1, tb=2, dt=DTW),
-            ]
+            plan += [op(GEMM_SB, a=dlogits, b=lm_w, c=dxf, m=N, k=V, n=D, batch=1, tb=0, dt=DT)]
+            if not lora:
+                plan += [op(GEMM_SB, a=dlogits, b=xf, c=G["embed.weight"], m=V, n=D, k=N, batch=1, tb=2, dt=DTW)]
         else:
-            plan += [
-                op(GEMM_SB, a=dlogits, b=lm_w, c=dxf, m=N, k=V, n=D, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=xf, b=dlogits, c=G["lm_head.weight"], m=D, n=V, k=N, batch=1, tb=2, dt=DTW),
-            ]
-        plan += [
-            op(RMSNORM_BWD, a=xs[L], b=P["norm.weight"], d=dxf, c=dcur, tb=tmpD, m=N, n=D, dt=DT, alpha=eps_n),
-            op(COLSUM, a=tmpD, c=G["norm.weight"], m=N, n=D, dt=DTW),
-        ]
+            plan += [op(GEMM_SB, a=dlogits, b=lm_w, c=dxf, m=N, k=V, n=D, batch=1, tb=1, dt=DT)]
+            if not lora:
+                plan += [op(GEMM_SB, a=xf, b=dlogits, c=G["lm_head.weight"], m=D, n=V, k=N, batch=1, tb=2, dt=DTW)]
+        plan += [op(RMSNORM_BWD, a=xs[L], b=P["norm.weight"], d=dxf, c=dcur, tb=tmpD, m=N, n=D, dt=DT, alpha=eps_n)]
+        if not lora:
+            plan += [op(COLSUM, a=tmpD, c=G["norm.weight"], m=N, n=D, dt=DTW)]
 
         # ── backward blocks (reverse) ──
         for i in reversed(range(L)):
             p = f"blocks.{i}."
+            plan += lin_b(dcur, hs[i], i, "mlp.down_proj", dh_)
+            plan += [op(SILU_BWD, a=gs[i], b=us[i], d=dh_, c=dg_, tb=du_, n=N * MLP, dt=DT)]
+            plan += lin_b(dg_, zs[i], i, "mlp.gate_proj", dz1)
+            plan += lin_b(du_, zs[i], i, "mlp.up_proj", dz2)
             plan += [
-                op(GEMM_SB, a=dcur, b=P[p + "mlp.down_proj.weight"], c=dh_, m=N, k=D, n=MLP, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=hs[i], b=dcur, c=G[p + "mlp.down_proj.weight"], m=MLP, n=D, k=N, batch=1, tb=2, dt=DTW),
-                op(SILU_BWD, a=gs[i], b=us[i], d=dh_, c=dg_, tb=du_, n=N * MLP, dt=DT),
-                op(GEMM_SB, a=dg_, b=P[p + "mlp.gate_proj.weight"], c=dz1, m=N, k=MLP, n=D, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=du_, b=P[p + "mlp.up_proj.weight"], c=dz2, m=N, k=MLP, n=D, batch=1, tb=1, dt=DT),
                 op(ADD, a=dz1, b=dz2, c=dz, n=N * D, dt=DT),
-                op(GEMM_SB, a=zs[i], b=dg_, c=G[p + "mlp.gate_proj.weight"], m=D, n=MLP, k=N, batch=1, tb=2, dt=DTW),
-                op(GEMM_SB, a=zs[i], b=du_, c=G[p + "mlp.up_proj.weight"], m=D, n=MLP, k=N, batch=1, tb=2, dt=DTW),
                 op(RMSNORM_BWD, a=r1s[i], b=P[p + "mlp_norm.weight"], d=dz, c=dr1b, tb=tmpD, m=N, n=D, dt=DT, alpha=eps_n),
-                op(COLSUM, a=tmpD, c=G[p + "mlp_norm.weight"], m=N, n=D, dt=DTW),
-                op(ADD, a=dcur, b=dr1b, c=dr1, n=N * D, dt=DT),
-                op(GEMM_SB, a=dr1, b=P[p + "attn.o_proj.weight"], c=dat2, m=N, k=D, n=H * DH, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=at2s[i], b=dr1, c=G[p + "attn.o_proj.weight"], m=H * DH, n=D, k=N, batch=1, tb=2, dt=DTW),
+            ]
+            if not lora:
+                plan += [op(COLSUM, a=tmpD, c=G[p + "mlp_norm.weight"], m=N, n=D, dt=DTW)]
+            plan += [op(ADD, a=dcur, b=dr1b, c=dr1, n=N * D, dt=DT)]
+            plan += lin_b(dr1, at2s[i], i, "attn.o_proj", dat2)
+            plan += [
                 op(PERM_0213, a=dat2, c=dat, m=B, n=T, k=H, batch=DH, dt=DT),
             ]
             if use_flash:
@@ -323,22 +408,25 @@ class CompiledTransformer:
                 op(PERM_0213, a=dq1, c=dq0, m=B, n=H, k=T, batch=DH, dt=DT),
                 op(PERM_0213, a=dk1, c=dk0, m=B, n=KV, k=T, batch=DH, dt=DT),
                 op(PERM_0213, a=dv1, c=dv0, m=B, n=KV, k=T, batch=DH, dt=DT),
-                op(GEMM_SB, a=dq0, b=P[p + "attn.q_proj.weight"], c=dy1, m=N, k=H * DH, n=D, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=dk0, b=P[p + "attn.k_proj.weight"], c=dy2, m=N, k=KV * DH, n=D, batch=1, tb=1, dt=DT),
-                op(GEMM_SB, a=dv0, b=P[p + "attn.v_proj.weight"], c=dy3, m=N, k=KV * DH, n=D, batch=1, tb=1, dt=DT),
+            ]
+            plan += lin_b(dq0, ys[i], i, "attn.q_proj", dy1)
+            plan += lin_b(dk0, ys[i], i, "attn.k_proj", dy2)
+            plan += lin_b(dv0, ys[i], i, "attn.v_proj", dy3)
+            plan += [
                 op(ADD, a=dy1, b=dy2, c=dy, n=N * D, dt=DT),
                 op(ADD, a=dy, b=dy3, c=dy, n=N * D, dt=DT),
-                op(GEMM_SB, a=ys[i], b=dq0, c=G[p + "attn.q_proj.weight"], m=D, n=H * DH, k=N, batch=1, tb=2, dt=DTW),
-                op(GEMM_SB, a=ys[i], b=dk0, c=G[p + "attn.k_proj.weight"], m=D, n=KV * DH, k=N, batch=1, tb=2, dt=DTW),
-                op(GEMM_SB, a=ys[i], b=dv0, c=G[p + "attn.v_proj.weight"], m=D, n=KV * DH, k=N, batch=1, tb=2, dt=DTW),
                 op(RMSNORM_BWD, a=xs[i], b=P[p + "attn_norm.weight"], d=dy, c=dx1, tb=tmpD, m=N, n=D, dt=DT, alpha=eps_n),
-                op(COLSUM, a=tmpD, c=G[p + "attn_norm.weight"], m=N, n=D, dt=DTW),
+            ]
+            if not lora:
+                plan += [op(COLSUM, a=tmpD, c=G[p + "attn_norm.weight"], m=N, n=D, dt=DTW)]
+            plan += [
                 op(ADD, a=dr1, b=dx1, c=dxin, n=N * D, dt=DT),
                 op(COPY, a=dxin, c=dcur, n=N * D, dt=DT),
             ]
-        if not tied:
-            plan += [op(SCALE, a=G["embed.weight"], c=G["embed.weight"], n=V * D, alpha=0.0)]
-        plan += [op(EMBED_BWD, a=dcur, b=self.b_ids, c=G["embed.weight"], m=N, n=D, dt=DTW if hf else 0)]
+        if not lora:
+            if not tied:
+                plan += [op(SCALE, a=G["embed.weight"], c=G["embed.weight"], n=V * D, alpha=0.0)]
+            plan += [op(EMBED_BWD, a=dcur, b=self.b_ids, c=G["embed.weight"], m=N, n=D, dt=DTW if hf else 0)]
 
         self.plan_fb = plan
         self._mb, self._vb = mb, vb
@@ -407,17 +495,34 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
         for x, y in loader:
             loss = ct.step(x, y)          # ONE native call — fwd+bwd+AdamW
+
+    LoRA models (axis.lora.apply_lora) are detected automatically: base
+    weights compile as frozen, only the adapters train.
     """
     blk = model.blocks[0]
-    cfg = dict(vocab_size=model.embed.weight.shape[0],
-               dim=model.embed.weight.shape[1],
+    # normalize LoRA wrapping: "...q_proj.base.weight" -> "...q_proj.weight"
+    weights = {n.replace(".base.weight", ".weight"): p.data
+               for n, p in model.named_parameters()}
+    from axis.lora import LoRALinear, _all_modules
+    lora_r, lora_alpha = 0, 16.0
+    for m in _all_modules(model):
+        if isinstance(m, LoRALinear):
+            lora_r = m.rank
+            lora_alpha = m.scaling * m.rank
+            break
+    targets = tuple(sorted({k.split(".")[-2] for k in weights
+                            if k.endswith(".lora_a")})) if lora_r else ()
+    cfg = dict(vocab_size=weights["embed.weight"].shape[0],
+               dim=weights["embed.weight"].shape[1],
                n_layers=len(model.blocks),
                n_heads=blk.attn.n_heads,
                n_kv_heads=blk.attn.n_kv_heads,
-               mlp_hidden=blk.mlp.gate_proj.weight.shape[1],
+               mlp_hidden=weights["blocks.0.mlp.gate_proj.weight"].shape[1],
                tie_embeddings=model.tie_embeddings)
-    weights = {n: p.data for n, p in model.named_parameters()}
     return CompiledTransformer(lib_path, cfg, weights, batch, seq,
                                lr=lr, wd=wd, tf32=tf32,
                                recompute_attn=recompute_attn, dtype=dtype,
-                               attn_tile=attn_tile, attn_impl=attn_impl)
+                               attn_tile=attn_tile, attn_impl=attn_impl,
+                               lora_r=lora_r, lora_alpha=lora_alpha,
+                               lora_targets=targets or ("q_proj", "k_proj",
+                                                        "v_proj", "o_proj"))

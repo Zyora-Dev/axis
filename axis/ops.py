@@ -437,6 +437,44 @@ def rope(x: Tensor, cos, sin) -> Tensor:
     return _make(data, (x,), "rope", backward)
 
 
+def checkpoint(fn, *inputs) -> Tensor:
+    """Gradient checkpointing: run `fn(*inputs)` WITHOUT storing its
+    intermediate activations. Forward executes under no_grad (one tape node);
+    backward RE-RUNS fn's forward with grad enabled and backpropagates through
+    the recomputed subgraph — parameter grads accumulate exactly as normal,
+    input grads are returned to the outer tape.
+
+    Trades one extra forward of `fn` for O(1)-per-block activation memory —
+    what makes deep/large models trainable. The RNG state is snapshotted so
+    stochastic layers (dropout) recompute the identical mask.
+    """
+    from axis.tensor import no_grad, get_rng, is_grad_enabled as _ige
+
+    rng_state = get_rng().bit_generator.state
+    with no_grad():
+        out = fn(*inputs)
+    data = out.data
+
+    tensor_inputs = tuple(t for t in inputs if isinstance(t, Tensor))
+    req = _ige()          # record if grad is on — fn's params need their grads
+    result = Tensor(data, requires_grad=req, _parents=tensor_inputs if req else (),
+                    _op="checkpoint")
+    if not req:
+        return result
+
+    def backward(g):
+        # Restore RNG so any stochastic op recomputes identically.
+        get_rng().bit_generator.state = rng_state
+        detached = [Tensor(t.data, requires_grad=True) if isinstance(t, Tensor) else t
+                    for t in inputs]
+        out2 = fn(*detached)
+        out2.backward(g)   # accumulates into fn's params (leaves) + detached inputs
+        return [(t, d.grad) for t, d in zip(inputs, detached) if isinstance(t, Tensor)]
+
+    result._backward = backward
+    return result
+
+
 def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor, scale: float) -> Tensor:
     """Causal attention in one op: softmax(mask(q@k^T * scale)) @ v.
 

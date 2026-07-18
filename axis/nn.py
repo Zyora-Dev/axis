@@ -356,6 +356,10 @@ class Transformer(Module):
         ])
         self.norm = RMSNorm(dim, eps=norm_eps)
         self.tie_embeddings = tie_embeddings
+        # Gradient checkpointing: recompute each block's forward in backward
+        # instead of storing its activations (O(1)-per-block memory; ~1 extra
+        # forward of compute). Set model.grad_checkpoint = True to enable.
+        self.grad_checkpoint = False
         if not tie_embeddings:
             self.lm_head = Linear(dim, vocab_size, bias=False)
 
@@ -363,7 +367,10 @@ class Transformer(Module):
         """tokens: [B, T] int64 → logits [B, T, V]."""
         x = self.embed(tokens)
         for block in self.blocks:
-            x = block(x)
+            if self.grad_checkpoint and self.training:
+                x = ops.checkpoint(block, x)
+            else:
+                x = block(x)
         x = self.norm(x)
         if self.tie_embeddings:
             # Tied LM head: logits = x @ E^T (differentiable through E).

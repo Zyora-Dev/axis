@@ -25,20 +25,28 @@ enum OpKind {
     OP_ADAMW = 5,      // fused AdamW: p,m,v updated from g (n elements)
     OP_SCALE = 6,      // c = a * alpha
     OP_COPY = 7,       // c = a
-    OP_GEMM_SB = 8,    // strided-batched: c[i][m,n] = alpha * a[i][m,k] @ b[i][k,n or n,k^T]
+    OP_GEMM_SB = 8,    // strided-batched: tb=0 NN, tb=1 NT (a@b^T, b=[n,k]), tb=2 TN (a[k,m]^T@b[k,n])
     OP_PERM_0213 = 9,  // [d0,d1,d2,d3] -> [d0,d2,d1,d3]  (dims m,n,k,batch = d0..d3)
-    OP_ROPE = 10,      // half-split rotary on [rows, dh]; cos=b, sin=d, T=m, dh=n
+    OP_ROPE = 10,      // half-split rotary on [rows, dh]; cos=b, sin=d, T=m, dh=n; tb=1 inverse
     OP_SOFTMAX_CAUSAL = 11, // rows = batch*T, row r masks cols > r%T; width n=T
     OP_REPEAT_KV = 12, // [B,KV,T,dh] -> [B,H,T,dh], grouped (h -> h/rep)
+    OP_RMSNORM_BWD = 13, // a=x b=w d=g -> c=dx, tb=tmp buf (g*x*inv for dw colsum)
+    OP_COLSUM = 14,    // c[n] = sum_rows a[m,n]
+    OP_REPEAT_KV_BWD = 15, // group-sum: [B,H,T,dh] -> [B,KV,T,dh]
+    OP_SOFTMAX_BWD = 16,   // a=p b=dp -> c = p*(dp - rowsum(dp*p)); rows=batch*m, width m
+    OP_SILU_BWD = 17,  // a=g b=u d=grad -> c=dg, tb=du buffer
+    OP_EMBED = 18,     // a=table[V,D] b=ids(float)[N] -> c=out[N,D]; m=N n=D
+    OP_EMBED_BWD = 19, // a=g[N,D] b=ids -> atomicAdd into c=dTable; m=N n=D
+    OP_CE = 20,        // a=logits[N,V] b=targets(float)[N] -> c=dlogits, d=loss(1); m=N n=V
 };
 
 typedef struct {
     int   kind;
     int   a, b, c, d;   // buffer indices (op-specific roles)
     int   m, n, k;      // dims
-    int   batch, tb;    // batch count, transpose-B flag
+    int   batch, tb;    // batch count, transpose flag / aux buffer
     int   sa, sb, sc;   // per-batch strides (elements)
-    float alpha, beta;  // scalars (eps, lr, scale, ...)
+    float alpha, beta, gamma;  // scalars (eps, lr, scale, ...)
 } EngOp;
 
 // ── global state ────────────────────────────────────────────────────────────
@@ -90,20 +98,154 @@ __global__ void k_rmsnorm(const float* x, const float* w, float* o,
     for (int j = threadIdx.x; j < dim; j += blockDim.x)
         o[r * dim + j] = x[r * dim + j] * inv * w[j];
 }
-// Fused AdamW: m,v moments + decoupled weight decay. alpha=lr, beta packs
-// nothing fancy in phase 1 — fixed betas/eps for the skeleton.
+// Fused AdamW (proper): moments beta1=.9 beta2=.95; alpha = lr*sqrt(bc2)/bc1,
+// beta = lr*wd (decoupled decay), gamma = eps*sqrt(bc2). Folded bias correction.
 __global__ void k_adamw(float* p, const float* g, float* m, float* v,
-                        float lr, float wd, float bc1, float bc2, int n) {
-    const float b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+                        float alpha, float beta, float gamma, int n) {
+    const float b1 = 0.9f, b2 = 0.95f;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gi = g[i];
     float mi = b1 * m[i] + (1.f - b1) * gi;
     float vi = b2 * v[i] + (1.f - b2) * gi * gi;
     m[i] = mi; v[i] = vi;
-    float mh = mi / bc1, vh = vi / bc2;
-    float pi = p[i] * (1.f - lr * wd);
-    p[i] = pi - lr * mh / (sqrtf(vh) + eps);
+    float pi = p[i] * (1.f - beta);
+    p[i] = pi - alpha * mi / (sqrtf(vi) + gamma);
+}
+
+// rmsnorm backward: per row two reductions (ss, gwx); dx out; tmp = g*x*inv for dw.
+__global__ void k_rmsnorm_bwd(const float* x, const float* w, const float* g,
+                              float* dx, float* tmp, int rows, int dim, float eps) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    extern __shared__ float sh[];
+    const float* xr = x + (long long)r * dim;
+    const float* gr = g + (long long)r * dim;
+    float ss = 0.f, gwx = 0.f;
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        ss += xr[j] * xr[j];
+        gwx += gr[j] * w[j] * xr[j];
+    }
+    sh[threadIdx.x] = ss; sh[blockDim.x + threadIdx.x] = gwx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sh[threadIdx.x] += sh[threadIdx.x + s];
+            sh[blockDim.x + threadIdx.x] += sh[blockDim.x + threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / dim + eps);
+    float coef = inv * inv * inv * (sh[blockDim.x] / dim);
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        float dxj = gr[j] * w[j] * inv - xr[j] * coef;
+        dx[(long long)r * dim + j] = dxj;
+        tmp[(long long)r * dim + j] = gr[j] * xr[j] * inv;
+    }
+}
+
+__global__ void k_colsum(const float* a, float* c, int rows, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    float acc = 0.f;
+    for (int r = 0; r < rows; r++) acc += a[(long long)r * n + j];
+    c[j] = acc;
+}
+
+__global__ void k_repeat_kv_bwd(const float* g, float* o, int B, int KV, int H,
+                                int T, int dh) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)B * KV * T * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = r % T; r /= T;
+    int kv = r % KV; r /= KV;
+    int b = (int)r;
+    int rep = H / KV;
+    float acc = 0.f;
+    for (int q = 0; q < rep; q++)
+        acc += g[(((long long)b * H + kv * rep + q) * T + t) * dh + j];
+    o[i] = acc;
+}
+
+__global__ void k_softmax_bwd(const float* p, const float* dp, float* ds,
+                              int width, long long rows) {
+    long long r = blockIdx.x;
+    if (r >= rows) return;
+    extern __shared__ float sh[];
+    const float* pr = p + r * width;
+    const float* dpr = dp + r * width;
+    float dot = 0.f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) dot += dpr[j] * pr[j];
+    sh[threadIdx.x] = dot; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    dot = sh[0];
+    for (int j = threadIdx.x; j < width; j += blockDim.x)
+        ds[r * width + j] = pr[j] * (dpr[j] - dot);
+}
+
+__global__ void k_silu_bwd(const float* g, const float* u, const float* grad,
+                           float* dg, float* du, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x = g[i];
+    float sig = 1.f / (1.f + expf(-x));
+    float silu = x * sig;
+    float dsilu = sig * (1.f + x * (1.f - sig));
+    dg[i] = grad[i] * u[i] * dsilu;
+    du[i] = grad[i] * silu;
+}
+
+__global__ void k_embed(const float* table, const float* ids, float* o, int N, int D) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)N * D) return;
+    int r = (int)(i / D), j = (int)(i % D);
+    o[i] = table[(long long)((int)ids[r]) * D + j];
+}
+
+__global__ void k_embed_bwd(const float* g, const float* ids, float* dT, int N, int D) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)N * D) return;
+    int r = (int)(i / D), j = (int)(i % D);
+    atomicAdd(&dT[(long long)((int)ids[r]) * D + j], g[i]);
+}
+
+// Fused CE: per row (block) max + sumexp; dlogits = (softmax - onehot)/N;
+// atomicAdd mean NLL into loss[0].
+__global__ void k_ce(const float* logits, const float* tgt, float* dlogits,
+                     float* loss, int N, int V) {
+    int r = blockIdx.x;
+    if (r >= N) return;
+    extern __shared__ float sh[];
+    const float* lr = logits + (long long)r * V;
+    float mx = -1e30f;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) mx = fmaxf(mx, lr[j]);
+    sh[threadIdx.x] = mx; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = sh[0]; __syncthreads();
+    float se = 0.f;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) se += expf(lr[j] - mx);
+    sh[threadIdx.x] = se; __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    se = sh[0];
+    int t = (int)tgt[r];
+    float inv = 1.f / N;
+    for (int j = threadIdx.x; j < V; j += blockDim.x) {
+        float p = expf(lr[j] - mx) / se;
+        dlogits[(long long)r * V + j] = (p - (j == t ? 1.f : 0.f)) * inv;
+    }
+    if (threadIdx.x == 0)
+        atomicAdd(loss, (logf(se) - (lr[t] - mx)) * inv);
 }
 
 // [d0,d1,d2,d3] -> [d0,d2,d1,d3]
@@ -136,6 +278,25 @@ __global__ void k_rope(const float* x, const float* cs, const float* sn,
     } else {
         int jj = j - half;
         o[i] = xr[jj] * sn[t * half + jj] + xr[j] * cs[t * half + jj];
+    }
+}
+
+// Inverse rotation (rope backward): dx1 = g1*c + g2*s ; dx2 = -g1*s + g2*c
+__global__ void k_rope_inv(const float* g, const float* cs, const float* sn,
+                           float* o, int T, int dh, long long rows) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = rows * dh;
+    if (i >= total) return;
+    int j = i % dh;
+    long long r = i / dh;
+    int t = (int)(r % T);
+    int half = dh / 2;
+    const float* gr = g + r * dh;
+    if (j < half) {
+        o[i] = gr[j] * cs[t * half + j] + gr[j + half] * sn[t * half + j];
+    } else {
+        int jj = j - half;
+        o[i] = -gr[jj] * sn[t * half + jj] + gr[j] * cs[t * half + jj];
     }
 }
 
@@ -229,22 +390,24 @@ static int exec_op(const EngOp* op) {
         case OP_MUL:      k_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
         case OP_SILU_MUL: k_silu_mul<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, op->n); break;
         case OP_RMSNORM:  k_rmsnorm<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, op->m, op->n, op->alpha); break;
-        case OP_ADAMW:    k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, op->alpha, op->beta, op->m / 1e6f, op->k / 1e6f, op->n); break;
+        case OP_ADAMW:    k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, C, D, op->alpha, op->beta, op->gamma, op->n); break;
         case OP_SCALE:    k_scale<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->alpha, op->n); break;
         case OP_COPY:     k_copy<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->n); break;
         case OP_GEMM_SB: {
-            // row-major batched: C[i][m,n] = alpha * A[i][m,k] @ (B[i][k,n] or B[i][n,k]^T)
             const float zero = 0.f;
             float al = op->alpha == 0.f ? 1.f : op->alpha;
-            if (!op->tb) {
+            if (op->tb == 0) {
                 return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_N, CUBLAS_OP_N,
                     op->n, op->m, op->k, &al,
                     B, op->n, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
-            } else {
-                // B row-major [n,k], want A @ B^T
+            } else if (op->tb == 1) {   // c = a @ b^T, b row-major [n,k]
                 return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_T, CUBLAS_OP_N,
                     op->n, op->m, op->k, &al,
                     B, op->k, op->sb, A, op->k, op->sa, &zero, C, op->n, op->sc, op->batch);
+            } else {                    // tb=2: c[m,n] = a[k,m]^T @ b[k,n]
+                return (int)cublasSgemmStridedBatched(g_blas, CUBLAS_OP_N, CUBLAS_OP_T,
+                    op->n, op->m, op->k, &al,
+                    B, op->n, op->sb, A, op->m, op->sa, &zero, C, op->n, op->sc, op->batch);
             }
         }
         case OP_PERM_0213: {
@@ -255,7 +418,10 @@ static int exec_op(const EngOp* op) {
         case OP_ROPE: {
             long long rows = (long long)op->batch * op->m;   // batch=B*H, m=T
             long long total = rows * op->n;
-            k_rope<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
+            if (!op->tb)
+                k_rope<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
+            else
+                k_rope_inv<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, D, C, op->m, op->n, rows);
             break;
         }
         case OP_SOFTMAX_CAUSAL: {
@@ -268,6 +434,38 @@ static int exec_op(const EngOp* op) {
             k_repeat_kv<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->batch, op->tb, op->n, op->m, op->k);
             break;
         }
+        case OP_RMSNORM_BWD:
+            k_rmsnorm_bwd<<<op->m, T, 2 * T * sizeof(float), g_stream>>>(A, B, D, C, g_bufs[op->tb], op->m, op->n, op->alpha);
+            break;
+        case OP_COLSUM:
+            k_colsum<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, C, op->m, op->n);
+            break;
+        case OP_REPEAT_KV_BWD: {
+            long long total = (long long)op->batch * op->tb * op->m * op->k;  // B*KV*T*dh
+            k_repeat_kv_bwd<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, C, op->batch, op->tb, op->n, op->m, op->k);
+            break;
+        }
+        case OP_SOFTMAX_BWD: {
+            long long rows = (long long)op->batch * op->m;
+            k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(A, B, C, op->m, rows);
+            break;
+        }
+        case OP_SILU_BWD:
+            k_silu_bwd<<<(op->n + T - 1) / T, T, 0, g_stream>>>(A, B, D, C, g_bufs[op->tb], op->n);
+            break;
+        case OP_EMBED: {
+            long long total = (long long)op->m * op->n;
+            k_embed<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, C, op->m, op->n);
+            break;
+        }
+        case OP_EMBED_BWD: {
+            long long total = (long long)op->m * op->n;
+            k_embed_bwd<<<(int)((total + T - 1) / T), T, 0, g_stream>>>(A, B, C, op->m, op->n);
+            break;
+        }
+        case OP_CE:
+            k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(A, B, C, D, op->m, op->n);
+            break;
         default: return 100;
     }
     return 0;
@@ -301,3 +499,7 @@ API int eng_replay(int times, int sync) {
 }
 
 API int eng_sync() { return (int)cudaStreamSynchronize(g_stream); }
+
+API int eng_set_tf32(int on) {
+    return (int)cublasSetMathMode(g_blas, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH);
+}

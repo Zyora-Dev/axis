@@ -11,13 +11,15 @@ from axis import optim
 from axis import accel
 from axis.checkpoint import save, load
 from axis.gradcheck import gradcheck
+from axis.pretrained import from_pretrained, read_safetensors
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",
     "manual_seed", "no_grad",
     "ops", "nn", "optim", "accel",
     "save", "load", "gradcheck",
+    "from_pretrained", "read_safetensors",
     "__version__",
 ]

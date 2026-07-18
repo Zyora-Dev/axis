@@ -64,7 +64,7 @@ class Tensor:
         requires_grad: whether this tensor participates in autograd.
     """
 
-    __slots__ = ("data", "grad", "requires_grad", "_backward", "_parents", "_op")
+    __slots__ = ("data", "grad", "requires_grad", "_backward", "_parents", "_op", "_dev")
 
     def __init__(
         self,
@@ -88,6 +88,10 @@ class Tensor:
         self._backward: Optional[Callable[[np.ndarray], None]] = None
         self._parents: tuple[Tensor, ...] = tuple(_parents)
         self._op: str = _op
+        # Optional cached GPU buffer (device residency). `.data` is always the
+        # source of truth; `_dev` just avoids re-uploading a value that is
+        # already on the GPU (e.g. a shared activation used by several matmuls).
+        self._dev = None
 
     # ── properties ──
     @property

@@ -189,8 +189,15 @@ def silu(a: Tensor) -> Tensor:
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     """Batched matmul with full broadcast support (numpy semantics).
-    Forward AND backward matmuls route through the GPU when enabled."""
-    data = _mm(a.data, b.data)
+    Forward AND backward matmuls route through the GPU when enabled. When
+    residency applies, the result is kept on the GPU (out._dev) and shared
+    inputs are uploaded once."""
+    dev = None
+    res = accel.matmul_resident(a, b) if accel.is_enabled() else None
+    if res is not None:
+        data, dev = res
+    else:
+        data = _mm(a.data, b.data)
     def backward(g):
         # dA = g @ B^T ; dB = A^T @ g  (with batch-dim reduction)
         b_t = np.swapaxes(b.data, -1, -2)
@@ -198,7 +205,9 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
         ga = _mm(g, np.ascontiguousarray(b_t))
         gb = _mm(np.ascontiguousarray(a_t), g)
         return [(a, _unbroadcast(ga, a.shape)), (b, _unbroadcast(gb, b.shape))]
-    return _make(data, (a, b), "matmul", backward)
+    out = _make(data, (a, b), "matmul", backward)
+    out._dev = dev
+    return out
 
 
 # ─── reductions ─────────────────────────────────────────────────────────────

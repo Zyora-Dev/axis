@@ -11,6 +11,7 @@ from typing import Iterable
 
 import numpy as np
 
+from axis import accel
 from axis.nn import Parameter
 
 
@@ -49,6 +50,7 @@ class AdamW:
             if self.weight_decay > 0.0:
                 p.data *= (1.0 - self.lr * self.weight_decay)
             p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            accel.invalidate(p)  # weights changed in place — drop stale GPU cache
 
     def zero_grad(self) -> None:
         for p in self.params:

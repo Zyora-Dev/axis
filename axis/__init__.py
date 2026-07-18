@@ -12,7 +12,7 @@ from axis import accel
 from axis.checkpoint import save, load
 from axis.gradcheck import gradcheck
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",

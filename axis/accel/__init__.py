@@ -111,6 +111,55 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
+# ─── device residency ───────────────────────────────────────────────────────
+# Upload (host->device) is ~10x the kernel time; download is cheap. We cache a
+# flat device buffer on a Tensor so a value already on the GPU (e.g. the shared
+# activation feeding q/k/v or gate/up) is uploaded ONCE, not per matmul.
+# `.data` stays valid (we still download results), so backward + correctness
+# are unchanged. Validated by the accel parity tests.
+
+_RESIDENT = True                 # enable the residency cache
+_up_count = 0                    # instrumentation: uploads performed
+_hit_count = 0                   # instrumentation: cache hits (uploads avoided)
+
+
+def residency_stats():
+    return {"uploads": _up_count, "hits": _hit_count}
+
+
+def reset_residency_stats():
+    global _up_count, _hit_count
+    _up_count = _hit_count = 0
+
+
+def to_device(t):
+    """Cached flat float32 device buffer for `t`. Uploads (and caches on
+    `t._dev`) only on a miss. Returns None if residency isn't possible."""
+    global _up_count, _hit_count
+    if not _ENABLED or _BACKEND is None or not _RESIDENT:
+        return None
+    dev = getattr(t, "_dev", None)
+    if dev is not None:
+        _hit_count += 1
+        return dev
+    if t.data.dtype != np.float32:
+        return None
+    try:
+        import locomp as lc
+        arr = np.ascontiguousarray(t.data, dtype=np.float32).reshape(-1)
+        dev = lc.tensor(arr, backend=_BACKEND)
+        t._dev = dev
+        _up_count += 1
+        return dev
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def invalidate(t) -> None:
+    """Drop the cached device buffer (call when `t.data` is mutated in place)."""
+    t._dev = None
+
+
 # ─── array-level accelerated functions (NumPy in, NumPy out) ────────────────
 # Phase 2 keeps autograd orchestration on CPU; these accelerate the heavy
 # forward math. Device residency (keeping tensors on-GPU across ops) is the
@@ -220,6 +269,58 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
                 res[bi] = ttc.numpy().reshape(M, N)
         return res.reshape(out_shape).astype(np.float32)
     except Exception:  # noqa: BLE001 — fall back to NumPy on any kernel issue
+        return None
+
+
+def matmul_resident(a, b):
+    """Device-resident batched matmul over Tensors `a`, `b`. Reuses cached
+    device buffers (so a shared activation is uploaded once) and keeps the
+    result on the GPU. Returns (out_ndarray, out_device_buffer) or None if the
+    fast path doesn't apply (caller falls back to `matmul`).
+
+    16-aligned shapes only, so the cached raw buffers need no host padding —
+    the transformer's common case.
+    """
+    if not _ENABLED or _BACKEND is None or not _RESIDENT:
+        return None
+    ad, bd = a.data, b.data
+    if ad.ndim < 2 or bd.ndim < 2 or ad.dtype != np.float32 or bd.dtype != np.float32:
+        return None
+    if _BACKEND == "cuda" and _TENSOR_CORES:
+        return None
+    K = ad.shape[-1]
+    N = bd.shape[-1]
+    out_shape = (*ad.shape[:-1], N)
+    if bd.ndim == 2:
+        if bd.shape[0] != K:
+            return None
+        B = 1
+        M = int(np.prod(ad.shape[:-1])) if ad.ndim > 1 else ad.shape[0]
+    else:
+        Bs = int(np.prod(ad.shape[:-2])) if ad.ndim > 2 else 1
+        Bb = int(np.prod(bd.shape[:-2])) if bd.ndim > 2 else 1
+        if Bs != Bb or bd.shape[-2] != K:
+            return None
+        B, M = Bs, ad.shape[-2]
+    if M % 16 or N % 16 or K % 16:
+        return None
+    try:
+        import locomp as lc
+        from axis.accel.batched_tiled import TILE, tiled_matmul_b
+        be = _BACKEND
+        a_dev = to_device(a)
+        b_dev = to_device(b)
+        if a_dev is None or b_dev is None:
+            return None
+        mtiles = M // TILE
+        nt = K // TILE
+        out_dev = lc.empty(B * M * N, backend=be)
+        grid = (N // TILE, B * mtiles)
+        _launcher(tiled_matmul_b.func, be)[grid, (TILE, TILE)](
+            a_dev, b_dev, out_dev, M, N, K, nt, TILE, mtiles)
+        data = out_dev.numpy().reshape(out_shape).astype(np.float32)
+        return data, out_dev
+    except Exception:  # noqa: BLE001
         return None
 
 

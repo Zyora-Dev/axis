@@ -29,6 +29,7 @@ class _EngOp(ctypes.Structure):
         ("batch", ctypes.c_int), ("tb", ctypes.c_int),
         ("sa", ctypes.c_int), ("sb", ctypes.c_int), ("sc", ctypes.c_int),
         ("dt", ctypes.c_int),
+        ("oa", ctypes.c_int), ("ob", ctypes.c_int), ("oc", ctypes.c_int),
         ("alpha", ctypes.c_float), ("beta", ctypes.c_float), ("gamma", ctypes.c_float),
     ]
 
@@ -36,13 +37,17 @@ class _EngOp(ctypes.Structure):
 def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
        m: int = 0, n: int = 0, k: int = 0,
        batch: int = 0, tb: int = 0, sa: int = 0, sb: int = 0, sc: int = 0,
-       dt: int = 0, alpha: float = 0.0, beta: float = 0.0, gamma: float = 0.0) -> Tuple:
+       dt: int = 0, oa: int = 0, ob: int = 0, oc: int = 0,
+       alpha: float = 0.0, beta: float = 0.0, gamma: float = 0.0) -> Tuple:
     """Op descriptor. dt: 0=fp32, 1=bf16 storage, 2=bf16 inputs/fp32 output.
+    oa/ob/oc: element offsets into a/b/c (GEMM query tiling).
+    beta (GEMM): 0 = overwrite C, 1 = accumulate into C.
     Notable role maps:
     GEMM_SB:  tb=0: c=a@b; tb=1: c=a@b^T (b=[n,k]); tb=2: c=a[k,m]^T@b[k,n]
     PERM_0213: dims (m,n,k,batch) = (d0,d1,d2,d3), out [d0,d2,d1,d3]
     ROPE:     a=[batch*m rows, n]; b=cos, d=sin (fp32); tb=1 -> inverse
-    SOFTMAX_CAUSAL/BWD: rows batch*m, width m; a(,b)->c
+    SOFTMAX_CAUSAL: rows batch*m; untiled width=m; tiled: n=key range, k=q offset
+    SOFTMAX_BWD: rows batch*m, width = n if n>0 else m
     REPEAT_KV(_BWD): batch=B, tb=KV, n=H, m=T, k=dh
     RMSNORM_BWD: a=x b=w d=g -> c=dx, tb=tmp buffer (colsum -> dw)
     SILU_BWD: a=g b=u d=grad -> c=dg, tb=du buffer
@@ -52,7 +57,8 @@ def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
            sa=bf16 param mirror (0 = none); alpha=lr beta=lr*wd gamma=eps
     CAST: a->c; tb=0 fp32->bf16, tb=1 bf16->fp32; m(*n)=count
     """
-    return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, alpha, beta, gamma)
+    return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, oa, ob, oc,
+            alpha, beta, gamma)
 
 
 class Engine:
@@ -105,7 +111,7 @@ class Engine:
     def _pack(self, plan: Sequence[Tuple]):
         arr = (_EngOp * len(plan))()
         for i, o in enumerate(plan):
-            arr[i] = _EngOp(*[int(x) if j < 14 else float(x) for j, x in enumerate(o)])
+            arr[i] = _EngOp(*[int(x) if j < 17 else float(x) for j, x in enumerate(o)])
         return arr
 
     def zero(self, idx: int, nfloats: int) -> Tuple:

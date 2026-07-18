@@ -31,6 +31,7 @@ typedef struct {
     int   batch, tb;
     int   sa, sb, sc;
     int   dt;                    // 0 fp32 | 1 bf16 | 2 bf16-in fp32-out
+    int   oa, ob, oc;            // element offsets into a/b/c (GEMM tiling)
     float alpha, beta, gamma;
 } EngOp;
 
@@ -69,7 +70,8 @@ __global__ void k_silu_mul(const T* a, const T* b, T* c, int n) {
 template <typename T>
 __global__ void k_scale(const T* a, T* c, float alpha, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) stf(c, i, ldf(a, i) * alpha);
+    // alpha==0 is an explicit ZERO (never read a: garbage NaN * 0 = NaN)
+    if (i < n) stf(c, i, alpha == 0.f ? 0.f : ldf(a, i) * alpha);
 }
 template <typename T>
 __global__ void k_copy(const T* a, T* c, int n) {
@@ -172,13 +174,16 @@ __global__ void k_rope_inv(const T* g, const float* cs, const float* sn,
         stf(o, i, -ldf(gr, jj) * sn[t * half + jj] + ldf(gr, j) * cs[t * half + jj]);
     }
 }
+// causal softmax over a query tile: row r covers global query row qoff+(r%rpb);
+// valid keys j <= that. width = key range of this tile. rpb=width for untiled.
 template <typename T>
-__global__ void k_softmax_causal(const T* x, T* o, int T_, long long rows) {
+__global__ void k_softmax_causal(const T* x, T* o, int rpb, int width, int qoff, long long rows) {
     long long r = blockIdx.x;
     if (r >= rows) return;
-    int t = (int)(r % T_);
+    int t = qoff + (int)(r % rpb);
+    if (t > width - 1) t = width - 1;
     extern __shared__ float sh[];
-    const T* xr = x + r * T_;
+    const T* xr = x + r * width;
     float mx = -1e30f;
     for (int j = threadIdx.x; j <= t; j += blockDim.x) mx = fmaxf(mx, ldf(xr, j));
     sh[threadIdx.x] = mx; __syncthreads();
@@ -195,8 +200,8 @@ __global__ void k_softmax_causal(const T* x, T* o, int T_, long long rows) {
         __syncthreads();
     }
     float denom = sh[0];
-    T* orow = o + r * T_;
-    for (int j = threadIdx.x; j < T_; j += blockDim.x)
+    T* orow = o + r * width;
+    for (int j = threadIdx.x; j < width; j += blockDim.x)
         stf(orow, j, (j <= t) ? expf(ldf(xr, j) - mx) / denom : 0.f);
 }
 template <typename T>
@@ -386,13 +391,17 @@ API int eng_download(int idx, float* host, long long nfloats) {
 
 static int gemm_ex(const EngOp* o) {
     // row-major via col-major swap (validated recipes), GemmStridedBatchedEx.
-    const float one = 1.f, zero = 0.f;
+    // oa/ob/oc: element offsets (query tiling). beta: 0=overwrite, 1=accumulate.
+    const float zero = 0.f;
     float al = o->alpha == 0.f ? 1.f : o->alpha;
+    float be = o->beta;
     cudaDataType ab = (o->dt >= 1) ? CUDA_R_16BF : CUDA_R_32F;
     cudaDataType cc = (o->dt == 1) ? CUDA_R_16BF : CUDA_R_32F;
-    const void* A = g_bufs[o->a];
-    const void* B = g_bufs[o->b];
-    void* C = g_bufs[o->c];
+    int esa = (ab == CUDA_R_16BF) ? 2 : 4;
+    int esc = (cc == CUDA_R_16BF) ? 2 : 4;
+    const void* A = (const char*)g_bufs[o->a] + (long long)o->oa * esa;
+    const void* B = (const char*)g_bufs[o->b] + (long long)o->ob * esa;
+    void* C = (char*)g_bufs[o->c] + (long long)o->oc * esc;
     int batch = o->batch > 0 ? o->batch : 1;
     long long sa = o->sa, sb = o->sb, sc = o->sc;
     cublasOperation_t opa, opb;
@@ -412,12 +421,12 @@ static int gemm_ex(const EngOp* o) {
         M1 = B; ld1 = o->n; s1 = sb;
         M2 = A; ld2 = o->m; s2 = sa;
     }
-    (void)one;
+    (void)zero;
     return (int)cublasGemmStridedBatchedEx(g_blas, opa, opb,
         o->n, o->m, o->k, &al,
         M1, ab, ld1, s1,
         M2, ab, ld2, s2,
-        &zero, C, cc, o->n, sc, batch,
+        &be, C, cc, o->n, sc, batch,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
@@ -487,8 +496,9 @@ static int exec_op(const EngOp* op) {
         }
         case OP_SOFTMAX_CAUSAL: {
             long long rows = (long long)op->batch * op->m;
-            if (h) k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->m, rows);
-            else   k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), EL(float)(C), op->m, rows);
+            int width = op->n > 0 ? op->n : op->m;   // tiled: n=key range, k=query offset
+            if (h) k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), EL(bf16)(C), op->m, width, op->k, rows);
+            else   k_softmax_causal<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), EL(float)(C), op->m, width, op->k, rows);
             break;
         }
         case OP_REPEAT_KV: {
@@ -515,8 +525,9 @@ static int exec_op(const EngOp* op) {
         }
         case OP_SOFTMAX_BWD: {
             long long rows = (long long)op->batch * op->m;
-            if (h) k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), op->m, rows);
-            else   k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), op->m, rows);
+            int width = op->n > 0 ? op->n : op->m;
+            if (h) k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(bf16)(C), width, rows);
+            else   k_softmax_bwd<<<(int)rows, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), width, rows);
             break;
         }
         case OP_SILU_BWD:

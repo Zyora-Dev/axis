@@ -26,7 +26,9 @@ class CompiledTransformer:
     def __init__(self, lib_path: str, cfg: dict, weights: Dict[str, np.ndarray],
                  batch: int, seq: int, lr: float = 3e-4, wd: float = 0.1,
                  eps: float = 1e-5, tf32: bool = True, recompute_attn: bool = True,
-                 dtype: str = "fp32"):
+                 dtype: str = "fp32", attn_tile: int = 256):
+        # recompute_attn: kept for API compat — tiled attention always
+        # recomputes probs per tile in backward (flash-style memory).
         assert dtype in ("fp32", "bf16")
         self.cfg = cfg
         self.B, self.T = batch, seq
@@ -101,13 +103,18 @@ class CompiledTransformer:
         self.b_loss = A(1)
 
         # ── per-block saved activations (dtype isz) ──
+        # NOTE: attention probs are NEVER materialized at [T,T] — attention is
+        # query-tiled (streaming): per tile of QT query rows only the causal
+        # key range [0, qs+qt) is computed (skips masked work), scratch is
+        # O(QT*T) not O(T*T), backward recomputes probs per tile.
+        QT = max(1, min(attn_tile, T))
+        tiles = [(qs, min(QT, T - qs)) for qs in range(0, T, QT)]
+        self.attn_tile = QT
         xs = [A(N * D, isz) for _ in range(L + 1)]
         ys = [A(N * D, isz) for _ in range(L)]
         q2s = [A(N * H * DH, isz) for _ in range(L)]
         krs = [A(N * H * DH, isz) for _ in range(L)]
         vrs = [A(N * H * DH, isz) for _ in range(L)]
-        pr_shared = A(BH * T * T, isz)
-        prs = [pr_shared] * L if recompute_attn else [A(BH * T * T, isz) for _ in range(L)]
         at2s = [A(N * H * DH, isz) for _ in range(L)]
         r1s = [A(N * D, isz) for _ in range(L)]
         zs = [A(N * D, isz) for _ in range(L)]
@@ -118,7 +125,9 @@ class CompiledTransformer:
         # ── shared scratch ──
         q0 = A(N * H * DH, isz); k0 = A(N * KV * DH, isz); v0 = A(N * KV * DH, isz)
         q1 = A(N * H * DH, isz); k1 = A(N * KV * DH, isz); v1 = A(N * KV * DH, isz)
-        k2 = A(N * KV * DH, isz); sc_ = A(BH * T * T, isz)
+        k2 = A(N * KV * DH, isz)
+        b_sct = A(BH * QT * T, isz)          # score tile   [BH, qt, kl]
+        b_prt = A(BH * QT * T, isz)          # probs tile
         at = A(N * H * DH, isz); o_ = A(N * D, isz); mo = A(N * D, isz)
         xf = A(N * D, isz)
         logits = A(N * V, isz); dlogits = A(N * V, isz)
@@ -127,7 +136,9 @@ class CompiledTransformer:
         dz1 = A(N * D, isz); dz2 = A(N * D, isz); dz = A(N * D, isz)
         dr1b = A(N * D, isz); dr1 = A(N * D, isz)
         dat2 = A(N * H * DH, isz); dat = A(N * H * DH, isz)
-        dpr = A(BH * T * T, isz); dvr = A(N * H * DH, isz); dsc = A(BH * T * T, isz)
+        b_dprt = A(BH * QT * T, isz)         # dprobs tile
+        b_dsct = A(BH * QT * T, isz)         # dscores tile
+        dvr = A(N * H * DH, isz)
         dq2 = A(N * H * DH, isz); dkr = A(N * H * DH, isz)
         dk2 = A(N * KV * DH, isz); dv1 = A(N * KV * DH, isz)
         dq1 = A(N * H * DH, isz); dk1 = A(N * KV * DH, isz)
@@ -154,11 +165,21 @@ class CompiledTransformer:
                 op(ROPE, a=k1, b=b_cos, d=b_sin, c=k2, batch=BKV, m=T, n=DH, dt=DT),
                 op(REPEAT_KV, a=k2, c=krs[i], batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
                 op(REPEAT_KV, a=v1, c=vrs[i], batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
-                op(GEMM_SB, a=q2s[i], b=krs[i], c=sc_, m=T, k=DH, n=T, batch=BH, tb=1,
-                   sa=T * DH, sb=T * DH, sc=T * T, dt=DT, alpha=scale),
-                op(SOFTMAX_CAUSAL, a=sc_, c=prs[i], batch=BH, m=T, dt=DT),
-                op(GEMM_SB, a=prs[i], b=vrs[i], c=at, m=T, k=T, n=DH, batch=BH,
-                   sa=T * T, sb=T * DH, sc=T * DH, dt=DT),
+            ]
+            # streaming attention: per query tile, causal key range only
+            for qs, qt in tiles:
+                kl = qs + qt
+                plan += [
+                    op(GEMM_SB, a=q2s[i], b=krs[i], c=b_sct, m=qt, k=DH, n=kl,
+                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
+                       oa=qs * DH, dt=DT, alpha=scale),
+                    op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BH, m=qt, n=kl,
+                       k=qs, dt=DT),
+                    op(GEMM_SB, a=b_prt, b=vrs[i], c=at, m=qt, k=kl, n=DH,
+                       batch=BH, sa=qt * kl, sb=T * DH, sc=T * DH,
+                       oc=qs * DH, dt=DT),
+                ]
+            plan += [
                 op(PERM_0213, a=at, c=at2s[i], m=B, n=H, k=T, batch=DH, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=P[p + "attn.o_proj.weight"], c=o_, m=N, k=H * DH, n=D, batch=1, dt=DT),
                 op(ADD, a=xs[i], b=o_, c=r1s[i], n=N * D, dt=DT),
@@ -215,23 +236,39 @@ class CompiledTransformer:
                 op(GEMM_SB, a=dr1, b=P[p + "attn.o_proj.weight"], c=dat2, m=N, k=D, n=H * DH, batch=1, tb=1, dt=DT),
                 op(GEMM_SB, a=at2s[i], b=dr1, c=G[p + "attn.o_proj.weight"], m=H * DH, n=D, k=N, batch=1, tb=2, dt=DTW),
                 op(PERM_0213, a=dat2, c=dat, m=B, n=T, k=H, batch=DH, dt=DT),
+                # dkr/dvr accumulate over query tiles (beta=1) — zero first
+                op(SCALE, a=dkr, c=dkr, n=N * H * DH, dt=DT, alpha=0.0),
+                op(SCALE, a=dvr, c=dvr, n=N * H * DH, dt=DT, alpha=0.0),
             ]
-            if recompute_attn:
+            # streaming attention backward: recompute probs per tile
+            for qs, qt in tiles:
+                kl = qs + qt
                 plan += [
-                    op(GEMM_SB, a=q2s[i], b=krs[i], c=sc_, m=T, k=DH, n=T, batch=BH, tb=1,
-                       sa=T * DH, sb=T * DH, sc=T * T, dt=DT, alpha=scale),
-                    op(SOFTMAX_CAUSAL, a=sc_, c=prs[i], batch=BH, m=T, dt=DT),
+                    op(GEMM_SB, a=q2s[i], b=krs[i], c=b_sct, m=qt, k=DH, n=kl,
+                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
+                       oa=qs * DH, dt=DT, alpha=scale),
+                    op(SOFTMAX_CAUSAL, a=b_sct, c=b_prt, batch=BH, m=qt, n=kl,
+                       k=qs, dt=DT),
+                    # dprobs = dat_tile @ v^T
+                    op(GEMM_SB, a=dat, b=vrs[i], c=b_dprt, m=qt, k=DH, n=kl,
+                       batch=BH, tb=1, sa=T * DH, sb=T * DH, sc=qt * kl,
+                       oa=qs * DH, dt=DT),
+                    # dv[:kl] += probs^T @ dat_tile
+                    op(GEMM_SB, a=b_prt, b=dat, c=dvr, m=kl, n=DH, k=qt,
+                       batch=BH, tb=2, sa=qt * kl, sb=T * DH, sc=T * DH,
+                       ob=qs * DH, dt=DT, beta=1.0),
+                    op(SOFTMAX_BWD, a=b_prt, b=b_dprt, c=b_dsct, batch=BH,
+                       m=qt, n=kl, dt=DT),
+                    # dq_tile = dscores @ k[:kl] * scale
+                    op(GEMM_SB, a=b_dsct, b=krs[i], c=dq2, m=qt, k=kl, n=DH,
+                       batch=BH, sa=qt * kl, sb=T * DH, sc=T * DH,
+                       oc=qs * DH, dt=DT, alpha=scale),
+                    # dk[:kl] += dscores^T @ q_tile * scale
+                    op(GEMM_SB, a=b_dsct, b=q2s[i], c=dkr, m=kl, n=DH, k=qt,
+                       batch=BH, tb=2, sa=qt * kl, sb=T * DH, sc=T * DH,
+                       ob=qs * DH, dt=DT, alpha=scale, beta=1.0),
                 ]
             plan += [
-                op(GEMM_SB, a=dat, b=vrs[i], c=dpr, m=T, k=DH, n=T, batch=BH, tb=1,
-                   sa=T * DH, sb=T * DH, sc=T * T, dt=DT),
-                op(GEMM_SB, a=prs[i], b=dat, c=dvr, m=T, n=DH, k=T, batch=BH, tb=2,
-                   sa=T * T, sb=T * DH, sc=T * DH, dt=DT),
-                op(SOFTMAX_BWD, a=prs[i], b=dpr, c=dsc, batch=BH, m=T, dt=DT),
-                op(GEMM_SB, a=dsc, b=krs[i], c=dq2, m=T, k=T, n=DH, batch=BH,
-                   sa=T * T, sb=T * DH, sc=T * DH, dt=DT, alpha=scale),
-                op(GEMM_SB, a=dsc, b=q2s[i], c=dkr, m=T, n=DH, k=T, batch=BH, tb=2,
-                   sa=T * T, sb=T * DH, sc=T * DH, dt=DT, alpha=scale),
                 op(REPEAT_KV_BWD, a=dkr, c=dk2, batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
                 op(REPEAT_KV_BWD, a=dvr, c=dv1, batch=B, tb=KV, n=H, m=T, k=DH, dt=DT),
                 op(ROPE, a=dq2, b=b_cos, d=b_sin, c=dq1, batch=BH, m=T, n=DH, tb=1, dt=DT),
@@ -316,7 +353,8 @@ class CompiledTransformer:
 
 def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
-                  recompute_attn: bool = True, dtype: str = "fp32") -> CompiledTransformer:
+                  recompute_attn: bool = True, dtype: str = "fp32",
+                  attn_tile: int = 256) -> CompiledTransformer:
     """Compile an axis.nn.Transformer instance into a native training step.
 
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
@@ -334,4 +372,5 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
     weights = {n: p.data for n, p in model.named_parameters()}
     return CompiledTransformer(lib_path, cfg, weights, batch, seq,
                                lr=lr, wd=wd, tf32=tf32,
-                               recompute_attn=recompute_attn, dtype=dtype)
+                               recompute_attn=recompute_attn, dtype=dtype,
+                               attn_tile=attn_tile)

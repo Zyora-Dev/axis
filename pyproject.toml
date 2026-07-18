@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "axis-ml"
 version = "0.11.2"
-description = "Axis — a reliable framework for training and fine-tuning transformers, by Zyora Labs"
+description = "Axis — India's first proprietary AI training & fine-tuning framework, by Zyora Labs"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
-authors = [{ name = "Zyora Labs" }]
+license = { text = "Proprietary" }
+authors = [{ name = "Vasanth", email = "vasu@zyoralabs.com" }]
+maintainers = [{ name = "Zyora Labs", email = "vasu@zyoralabs.com" }]
 keywords = [
   "deep-learning", "transformers", "training", "fine-tuning",
   "autograd", "llm", "machine-learning",
@@ -21,7 +22,8 @@ dev = ["pytest>=7.0"]
 hf = ["regex"]  # real HuggingFace byte-level BPE tokenizer (axis.tokenizer)
 
 [project.urls]
-Homepage = "https://github.com/Zyora-Dev/axis"
+Homepage = "https://zyoralabs.com"
+Repository = "https://github.com/Zyora-Dev/axis"
 
 [tool.setuptools.packages.find]
 include = ["axis*"]

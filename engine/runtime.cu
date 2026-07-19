@@ -40,7 +40,7 @@ enum OpKind {
     OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
     OP_FLASH = 23, OP_ROWDOT = 24, OP_FLASH_BWD = 25,
     OP_ALLREDUCE = 26, OP_GROUP = 27, OP_L2ACC = 28, OP_CLIPSCALE = 29,
-    OP_COUNTVALID = 30,
+    OP_COUNTVALID = 30, OP_BROADCAST = 31,
 };
 
 typedef struct {
@@ -1145,6 +1145,16 @@ static int exec_op(const EngOp* op) {
             // tb=0 -> ncclGroupStart, tb=1 -> ncclGroupEnd (batches collectives)
 #ifdef AXIS_NCCL
             return (int)(op->tb ? ncclGroupEnd() : ncclGroupStart());
+#else
+            return 103;
+#endif
+        case OP_BROADCAST:
+            // ZeRO param sync: a=buffer, n=count, tb=root rank; dt=1 bf16 else fp32
+#ifdef AXIS_NCCL
+            if (!g_comm) return 104;
+            return (int)ncclBroadcast(g_bufs[op->a], g_bufs[op->a], op->n,
+                                      op->dt == 1 ? ncclBfloat16 : ncclFloat,
+                                      op->tb, g_comm, g_stream);
 #else
             return 103;
 #endif

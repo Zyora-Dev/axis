@@ -18,7 +18,7 @@ import numpy as np
  GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
  RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD, SILU_BWD,
  EMBED, EMBED_BWD, CE, TICK, CAST, FLASH, ROWDOT, FLASH_BWD,
- ALLREDUCE, GROUP, L2ACC, CLIPSCALE, COUNTVALID) = range(31)
+ ALLREDUCE, GROUP, L2ACC, CLIPSCALE, COUNTVALID, BROADCAST) = range(32)
 
 
 class _EngOp(ctypes.Structure):
@@ -69,6 +69,7 @@ def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
            m=T n=DH k=KV batch=B; alpha=scale; dq/dk/dv fp32, pre-zeroed
     ALLREDUCE: a=fp32 buffer, n=count — NCCL average across ranks
     GROUP: tb=0 ncclGroupStart, tb=1 ncclGroupEnd
+    BROADCAST: a=buffer, n=count, tb=root rank; dt=1 bf16 else fp32 (ZeRO sync)
     """
     return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, oa, ob, oc,
             alpha, beta, gamma)

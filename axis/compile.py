@@ -21,7 +21,7 @@ from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
                          SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST,
                          FLASH, ROWDOT, FLASH_BWD, ALLREDUCE, GROUP,
-                         L2ACC, CLIPSCALE, COUNTVALID)
+                         L2ACC, CLIPSCALE, COUNTVALID, BROADCAST)
 
 
 class CompiledTransformer:
@@ -32,7 +32,8 @@ class CompiledTransformer:
                  lora_r: int = 0, lora_alpha: float = 16.0,
                  lora_targets=("q_proj", "k_proj", "v_proj", "o_proj",
                                "gate_proj", "up_proj", "down_proj"),
-                 grad_sync: bool = False, max_grad_norm: float = 0.0):
+                 grad_sync: bool = False, max_grad_norm: float = 0.0,
+                 zero_stage: int = 0, rank: int = 0, world: int = 1):
         # recompute_attn: kept for API compat — tiled attention always
         # recomputes probs per tile in backward (flash-style memory).
         # attn_impl: "auto" (fused flash kernel when eligible: bf16, head_dim
@@ -110,6 +111,26 @@ class CompiledTransformer:
                         anames += [f"blocks.{i}.{pref}.lora_a",
                                    f"blocks.{i}.{pref}.lora_b"]
         self.pnames = anames if lora else base_names       # TRAINABLE params
+        self.shapes = {nm: (src[nm].shape if (lora and nm in src) else weights[nm].shape)
+                       for nm in self.pnames}
+        # ZeRO stage 1: shard the optimizer state (fp32 master + m + v) across
+        # ranks. Each param is OWNED by one rank (greedy element-count balance);
+        # only the owner holds/updates its optimizer state, then the updated
+        # bf16 weights are broadcast so every rank has the full model for the
+        # next forward. bf16 mirrors + grads stay replicated. Requires bf16 DP.
+        zero = zero_stage >= 1 and world > 1
+        if zero:
+            assert hf, "ZeRO sharding requires dtype='bf16'"
+            assert grad_sync, "ZeRO sharding requires grad_sync=True (multi-GPU)"
+        load = [0] * world
+        owner = {}
+        for nm in sorted(self.pnames, key=lambda n: -int(np.prod(self.shapes[n]))):
+            r = int(np.argmin(load)) if zero else 0
+            owner[nm] = r
+            load[r] += int(np.prod(self.shapes[nm]))
+        self.owner, self.rank, self.world, self.zero = owner, rank, world, zero
+        self.owned = [nm for nm in self.pnames if not zero or owner[nm] == rank]
+
         self.master, self.gbuf, mb, vb = {}, {}, {}, {}
         P = {}                              # compute-view of each param
         cast_in = []
@@ -139,19 +160,34 @@ class CompiledTransformer:
                             np.zeros((lora_r, fout), dtype=np.float32)
         else:
             src = weights
-        self.shapes = {nm: src[nm].shape for nm in self.pnames}
-        for nm in self.pnames:
-            w = np.ascontiguousarray(src[nm], dtype=np.float32)
-            self.master[nm] = eng.new_tensor(w)
-            self.gbuf[nm] = A(w.size)                       # fp32 grads
-            mb[nm] = eng.new_tensor(np.zeros_like(w))
-            vb[nm] = eng.new_tensor(np.zeros_like(w))
-            if hf:
-                P[nm] = A(w.size, isz)                      # bf16 mirror
-                cast_in.append(op(CAST, a=self.master[nm], c=P[nm], m=w.size, tb=0))
-            else:
-                P[nm] = self.master[nm]
-        self.pb = P
+        if zero:
+            # sharded: bf16 mirror + grad on ALL ranks (forward + reduce);
+            # fp32 master/m/v only on the owner. mirror inited via staging.
+            stage_z = A(max(int(np.prod(self.shapes[nm])) for nm in self.pnames))
+            for nm in self.pnames:
+                w = np.ascontiguousarray(src[nm], dtype=np.float32)
+                P[nm] = A(w.size, isz)
+                eng.upload(stage_z, w.reshape(-1))
+                eng.run([op(CAST, a=stage_z, c=P[nm], m=w.size, tb=0)])
+                self.gbuf[nm] = A(w.size)
+                if owner[nm] == rank:
+                    self.master[nm] = eng.new_tensor(w)
+                    mb[nm] = eng.new_tensor(np.zeros_like(w))
+                    vb[nm] = eng.new_tensor(np.zeros_like(w))
+            self.pb = P
+        else:
+            for nm in self.pnames:
+                w = np.ascontiguousarray(src[nm], dtype=np.float32)
+                self.master[nm] = eng.new_tensor(w)
+                self.gbuf[nm] = A(w.size)                       # fp32 grads
+                mb[nm] = eng.new_tensor(np.zeros_like(w))
+                vb[nm] = eng.new_tensor(np.zeros_like(w))
+                if hf:
+                    P[nm] = A(w.size, isz)                      # bf16 mirror
+                    cast_in.append(op(CAST, a=self.master[nm], c=P[nm], m=w.size, tb=0))
+                else:
+                    P[nm] = self.master[nm]
+            self.pb = P
         if cast_in:
             eng.run(cast_in)                                # one-time weight cast
 
@@ -467,6 +503,16 @@ class CompiledTransformer:
         self._wd = {nm: (self.wd if len(self.shapes[nm]) >= 2 else 0.0)
                     for nm in self.pnames}
         gsc = self.b_gscale if self._clip else 0
+        # ZeRO stage 1: only the owner runs AdamW for a param; the updated bf16
+        # weights are then broadcast from each owner so every rank has the full
+        # model for the next forward. Non-ZeRO: owned == all params.
+        self._bcast = []
+        if self.zero:
+            self._bcast = ([op(GROUP, tb=0)]
+                           + [op(BROADCAST, a=self.pb[nm],
+                                 n=int(np.prod(self.shapes[nm])),
+                                 tb=self.owner[nm], dt=1) for nm in self.pnames]
+                           + [op(GROUP, tb=1)])
         self.plan_step = (self.plan_fb + self.plan_ar + self._clip
                           + [op(TICK, a=self.b_t)]
                           + [op(ADAMW, a=self.master[nm], b=self.gbuf[nm],
@@ -475,7 +521,8 @@ class CompiledTransformer:
                                 sb=self.b_lr, oa=gsc,
                                 n=int(np.prod(self.shapes[nm])),
                                 alpha=self.lr, beta=self._wd[nm], gamma=1e-8)
-                             for nm in self.pnames])
+                             for nm in self.owned]
+                          + self._bcast)
 
     def _adamw_ops(self, t: int):
         hf = self.dtype == "bf16"
@@ -487,7 +534,7 @@ class CompiledTransformer:
         return [op(ADAMW, a=self.master[nm], b=self.gbuf[nm], c=self._mb[nm],
                    d=self._vb[nm], tb=-1, sa=(self.pb[nm] if hf else 0),
                    n=int(np.prod(self.shapes[nm])), alpha=a_lr,
-                   beta=self._wd[nm], gamma=g_eps) for nm in self.pnames]
+                   beta=self._wd[nm], gamma=g_eps) for nm in self.owned] + self._bcast
 
     # ── API ──
     def set_lr(self, lr: float) -> None:
@@ -523,15 +570,18 @@ class CompiledTransformer:
                 for nm in self.pnames}
 
     def get_weights(self) -> Dict[str, np.ndarray]:
-        """Current (master, fp32) weights — for checkpointing/export."""
+        """Current (master, fp32) weights — for checkpointing/export. Under
+        ZeRO, returns only this rank's OWNED shard (merge across ranks for the
+        full model)."""
         return {nm: self.eng.download(self.master[nm], self.shapes[nm])
-                for nm in self.pnames}
+                for nm in self.owned}
 
     def state_dict(self) -> Dict[str, np.ndarray]:
         """Full resumable training state: trainable weights + AdamW moments +
-        step counter + lr. `load_state_dict` restores it exactly."""
+        step counter + lr. `load_state_dict` restores it exactly. Under ZeRO,
+        this rank saves only its owned shard (each rank saves its own)."""
         st = {}
-        for nm in self.pnames:
+        for nm in self.owned:
             sh = self.shapes[nm]
             st[f"w/{nm}"] = self.eng.download(self.master[nm], sh)
             st[f"m/{nm}"] = self.eng.download(self._mb[nm], sh)
@@ -545,7 +595,7 @@ class CompiledTransformer:
         the bf16 mirrors so the compute view matches the restored masters."""
         hf = self.dtype == "bf16"
         refresh = []
-        for nm in self.pnames:
+        for nm in self.owned:
             self.eng.upload(self.master[nm], st[f"w/{nm}"].reshape(-1))
             self.eng.upload(self._mb[nm], st[f"m/{nm}"].reshape(-1))
             self.eng.upload(self._vb[nm], st[f"v/{nm}"].reshape(-1))
@@ -562,7 +612,8 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
                   recompute_attn: bool = True, dtype: str = "fp32",
                   attn_tile: int = 256, attn_impl: str = "auto",
-                  grad_sync: bool = False, max_grad_norm: float = 0.0) -> CompiledTransformer:
+                  grad_sync: bool = False, max_grad_norm: float = 0.0,
+                  zero_stage: int = 0, rank: int = 0, world: int = 1) -> CompiledTransformer:
     """Compile an axis.nn.Transformer instance into a native training step.
 
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
@@ -599,4 +650,5 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                                lora_r=lora_r, lora_alpha=lora_alpha,
                                lora_targets=targets or ("q_proj", "k_proj",
                                                         "v_proj", "o_proj"),
-                               grad_sync=grad_sync, max_grad_norm=max_grad_norm)
+                               grad_sync=grad_sync, max_grad_norm=max_grad_norm,
+                               zero_stage=zero_stage, rank=rank, world=world)

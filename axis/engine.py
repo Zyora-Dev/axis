@@ -17,7 +17,8 @@ import numpy as np
 (GEMM, ADD, MUL, SILU_MUL, RMSNORM, ADAMW, SCALE, COPY,
  GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
  RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD, SILU_BWD,
- EMBED, EMBED_BWD, CE, TICK, CAST, FLASH, ROWDOT, FLASH_BWD) = range(26)
+ EMBED, EMBED_BWD, CE, TICK, CAST, FLASH, ROWDOT, FLASH_BWD,
+ ALLREDUCE, GROUP) = range(28)
 
 
 class _EngOp(ctypes.Structure):
@@ -61,6 +62,8 @@ def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
     ROWDOT: c[r] = sum_d a[r,d]*b[r,d]; m=rows n=dim; fp32 out
     FLASH_BWD: a=q b=k d=v c=dO; sa=lse sb=D tb=dqf sc=dkf oa=dvf ob=H;
            m=T n=DH k=KV batch=B; alpha=scale; dq/dk/dv fp32, pre-zeroed
+    ALLREDUCE: a=fp32 buffer, n=count — NCCL average across ranks
+    GROUP: tb=0 ncclGroupStart, tb=1 ncclGroupEnd
     """
     return (kind, a, b, c, d, m, n, k, batch, tb, sa, sb, sc, dt, oa, ob, oc,
             alpha, beta, gamma)
@@ -93,6 +96,19 @@ class Engine:
         if rc:
             raise RuntimeError(f"alloc({nelems}x{itemsize}) failed rc={rc}")
         return idx
+
+    # ── NCCL (requires runtime built with -DAXIS_NCCL) ──
+    def nccl_id(self) -> bytes:
+        buf = (ctypes.c_char * 128)()
+        rc = self.lib.eng_nccl_id(buf)
+        if rc:
+            raise RuntimeError(f"nccl_id failed rc={rc}")
+        return bytes(buf)
+
+    def nccl_init(self, rank: int, world: int, uid: bytes) -> None:
+        rc = self.lib.eng_nccl_init(rank, world, uid)
+        if rc:
+            raise RuntimeError(f"nccl_init(rank={rank}) failed rc={rc}")
 
     def upload(self, idx: int, arr: np.ndarray) -> None:
         a = np.ascontiguousarray(arr, dtype=np.float32)

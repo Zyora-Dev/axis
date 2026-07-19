@@ -20,7 +20,7 @@ from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL,
                          RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
                          SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST,
-                         FLASH, ROWDOT, FLASH_BWD)
+                         FLASH, ROWDOT, FLASH_BWD, ALLREDUCE, GROUP)
 
 
 class CompiledTransformer:
@@ -30,7 +30,8 @@ class CompiledTransformer:
                  dtype: str = "fp32", attn_tile: int = 256, attn_impl: str = "auto",
                  lora_r: int = 0, lora_alpha: float = 16.0,
                  lora_targets=("q_proj", "k_proj", "v_proj", "o_proj",
-                               "gate_proj", "up_proj", "down_proj")):
+                               "gate_proj", "up_proj", "down_proj"),
+                 grad_sync: bool = False):
         # recompute_attn: kept for API compat — tiled attention always
         # recomputes probs per tile in backward (flash-style memory).
         # attn_impl: "auto" (fused flash kernel when eligible: bf16, head_dim
@@ -431,9 +432,19 @@ class CompiledTransformer:
         self.plan_fb = plan
         self._mb, self._vb = mb, vb
         self._captured = False
+        # data parallel: average grads across ranks between backward and AdamW
+        # (ONE batched NCCL group over all trainable grads; caller must
+        # eng.nccl_init(rank, world, uid) before stepping)
+        self.plan_ar = []
+        if grad_sync:
+            self.plan_ar = ([op(GROUP, tb=0)]
+                            + [op(ALLREDUCE, a=self.gbuf[nm],
+                                  n=int(np.prod(self.shapes[nm])))
+                               for nm in self.pnames]
+                            + [op(GROUP, tb=1)])
         # device-side step counter — AdamW bias correction on device (graph-exact)
         self.b_t = eng.new_tensor(np.zeros(1, dtype=np.float32))
-        self.plan_step = (self.plan_fb
+        self.plan_step = (self.plan_fb + self.plan_ar
                           + [op(TICK, a=self.b_t)]
                           + [op(ADAMW, a=self.master[nm], b=self.gbuf[nm],
                                 c=self._mb[nm], d=self._vb[nm], tb=self.b_t,
@@ -460,14 +471,14 @@ class CompiledTransformer:
         if t is None:
             self.eng.run(self.plan_step, sync=False)
         else:
-            self.eng.run(self.plan_fb + self._adamw_ops(t), sync=False)
+            self.eng.run(self.plan_fb + self.plan_ar + self._adamw_ops(t), sync=False)
         return float(self.eng.download(self.b_loss, (1,))[0])
 
     def capture(self, t: int = None) -> None:
         if t is None:
             self.eng.capture(self.plan_step)
         else:
-            self.eng.capture(self.plan_fb + self._adamw_ops(t))
+            self.eng.capture(self.plan_fb + self.plan_ar + self._adamw_ops(t))
         self._captured = True
 
     def replay_step(self, tokens: np.ndarray, targets: np.ndarray) -> float:
@@ -489,7 +500,8 @@ class CompiledTransformer:
 def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
                   recompute_attn: bool = True, dtype: str = "fp32",
-                  attn_tile: int = 256, attn_impl: str = "auto") -> CompiledTransformer:
+                  attn_tile: int = 256, attn_impl: str = "auto",
+                  grad_sync: bool = False) -> CompiledTransformer:
     """Compile an axis.nn.Transformer instance into a native training step.
 
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
@@ -525,4 +537,5 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                                attn_tile=attn_tile, attn_impl=attn_impl,
                                lora_r=lora_r, lora_alpha=lora_alpha,
                                lora_targets=targets or ("q_proj", "k_proj",
-                                                        "v_proj", "o_proj"))
+                                                        "v_proj", "o_proj"),
+                               grad_sync=grad_sync)

@@ -11,6 +11,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+#ifdef AXIS_NCCL
+#include <nccl.h>
+#endif
 
 #define API extern "C" __attribute__((visibility("default")))
 #define MAX_BUFS 8192
@@ -24,6 +27,7 @@ enum OpKind {
     OP_COLSUM = 14, OP_REPEAT_KV_BWD = 15, OP_SOFTMAX_BWD = 16, OP_SILU_BWD = 17,
     OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
     OP_FLASH = 23, OP_ROWDOT = 24, OP_FLASH_BWD = 25,
+    OP_ALLREDUCE = 26, OP_GROUP = 27,
 };
 
 typedef struct {
@@ -43,6 +47,9 @@ static cudaStream_t   g_stream = nullptr;
 static void*          g_ws = nullptr;
 static void*          g_bufs[MAX_BUFS];
 static cudaGraphExec_t g_graph_exec = nullptr;
+#ifdef AXIS_NCCL
+static ncclComm_t     g_comm = nullptr;
+#endif
 
 // ── load/store helpers (fp32 math, T storage) ───────────────────────────────
 __device__ __forceinline__ float ldf(const float* p, long long i) { return p[i]; }
@@ -764,6 +771,23 @@ API int eng_alloc(int idx, long long nelems, int elsize) {
     return 0;
 }
 
+// ── NCCL data parallel (built with -DAXIS_NCCL) ─────────────────────────
+API int eng_nccl_id(void* out128) {
+#ifdef AXIS_NCCL
+    return (int)ncclGetUniqueId((ncclUniqueId*)out128);
+#else
+    (void)out128; return 103;
+#endif
+}
+
+API int eng_nccl_init(int rank, int world, const void* id128) {
+#ifdef AXIS_NCCL
+    return (int)ncclCommInitRank(&g_comm, world, *(const ncclUniqueId*)id128, rank);
+#else
+    (void)rank; (void)world; (void)id128; return 103;
+#endif
+}
+
 API int eng_upload(int idx, const float* host, long long nfloats) {
     return (int)cudaMemcpyAsync(g_bufs[idx], host, sizeof(float) * nfloats,
                                 cudaMemcpyHostToDevice, g_stream);
@@ -998,6 +1022,22 @@ static int exec_op(const EngOp* op) {
             }
             break;
         }
+        case OP_ALLREDUCE:
+            // a = fp32 buffer, n = element count; AVERAGES across ranks
+#ifdef AXIS_NCCL
+            if (!g_comm) return 104;
+            return (int)ncclAllReduce(g_bufs[op->a], g_bufs[op->a], op->n,
+                                      ncclFloat, ncclAvg, g_comm, g_stream);
+#else
+            return 103;
+#endif
+        case OP_GROUP:
+            // tb=0 -> ncclGroupStart, tb=1 -> ncclGroupEnd (batches collectives)
+#ifdef AXIS_NCCL
+            return (int)(op->tb ? ncclGroupEnd() : ncclGroupStart());
+#else
+            return 103;
+#endif
         default: return 100;
     }
     return 0;

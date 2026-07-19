@@ -111,8 +111,15 @@ class CompiledTransformer:
                         anames += [f"blocks.{i}.{pref}.lora_a",
                                    f"blocks.{i}.{pref}.lora_b"]
         self.pnames = anames if lora else base_names       # TRAINABLE params
-        self.shapes = {nm: (src[nm].shape if (lora and nm in src) else weights[nm].shape)
-                       for nm in self.pnames}
+        if lora:
+            self.shapes = {}
+            for i in range(L):
+                for pref, (fin, fout) in lin_geom.items():
+                    if pref.split(".")[-1] in lset:
+                        self.shapes[f"blocks.{i}.{pref}.lora_a"] = (fin, lora_r)
+                        self.shapes[f"blocks.{i}.{pref}.lora_b"] = (lora_r, fout)
+        else:
+            self.shapes = {nm: weights[nm].shape for nm in self.pnames}
         # ZeRO stage 1: shard the optimizer state (fp32 master + m + v) across
         # ranks. Each param is OWNED by one rank (greedy element-count balance);
         # only the owner holds/updates its optimizer state, then the updated

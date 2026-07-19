@@ -87,6 +87,11 @@ class Engine:
         if rc:
             raise RuntimeError(f"engine init failed rc={rc}")
         self._next = 0
+        # backend capability: fused flash attention (CUDA WMMA; not HIP v1)
+        try:
+            self.has_flash = bool(self.lib.eng_has_flash())
+        except AttributeError:
+            self.has_flash = False
 
     # ── buffers ──
     def alloc(self, nelems: int, itemsize: int = 4) -> int:

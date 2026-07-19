@@ -171,10 +171,10 @@ class CompiledTransformer:
         tiles = [(qs, min(QT, T - qs)) for qs in range(0, T, QT)]
         self.attn_tile = QT
         rep = H // KV
-        flash_ok = hf and DH % 16 == 0 and DH <= 128
+        flash_ok = hf and DH % 16 == 0 and DH <= 128 and eng.has_flash
         if attn_impl == "flash" and not flash_ok:
-            raise ValueError("flash attention needs dtype=bf16 and head_dim "
-                             "multiple of 16, <=128")
+            raise ValueError("flash attention needs a CUDA build (WMMA) with "
+                             "dtype=bf16 and head_dim multiple of 16, <=128")
         use_flash = flash_ok if attn_impl == "auto" else attn_impl == "flash"
         self.attn_impl = "flash" if use_flash else "tiled"
         xs = [A(N * D, isz) for _ in range(L + 1)]

@@ -7,17 +7,29 @@
 //
 // Build: nvcc -O3 -arch=sm_80 --shared -Xcompiler -fPIC runtime.cu -lcublas -o libaxeng.so
 #include <cstdio>
+#ifdef AXIS_HIP
+#include "hip_compat.h"
+typedef __hip_bfloat16 bf16;
+#else
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <mma.h>
+#include <mma.h>          // WMMA flash kernels — NVIDIA only
+typedef __nv_bfloat16 bf16;
+#endif
 #ifdef AXIS_NCCL
+#ifdef AXIS_HIP
+#include <rccl/rccl.h>
+#else
 #include <nccl.h>
+#endif
 #endif
 
 #define API extern "C" __attribute__((visibility("default")))
 #define MAX_BUFS 8192
-typedef __nv_bfloat16 bf16;
+#ifndef AXIS_HIP
+#define AXIS_FLASH        // fused WMMA attention available (CUDA)
+#endif
 
 // ── op kinds ────────────────────────────────────────────────────────────────
 enum OpKind {
@@ -369,7 +381,8 @@ __global__ void k_cast_b2f(const bf16* a, float* c, long long n) {
     if (i < n) c[i] = __bfloat162float(a[i]);
 }
 
-// ── fused flash attention forward (bf16, WMMA tensor cores) ───────────────
+// ── fused flash attention forward (bf16, WMMA tensor cores) ──────────────
+#ifdef AXIS_FLASH
 // One block per (b*h, query tile of BR rows). K/V stream through shared memory
 // in BC-column tiles with ONLINE softmax — probabilities never touch HBM.
 // GQA-native: kv head = h / (H/KV). Causal: tiles fully above the diagonal are
@@ -747,20 +760,27 @@ static size_t flash_bwd_smem(int BR, int BC, int DH) {
     return (size_t)(BR * sld + 2 * BR) * 4
          + (size_t)(2 * BC * (DH + 8) + 2 * BR * (DH + 8) + 2 * BR * (BC + 8)) * 2;
 }
+#endif  // AXIS_FLASH
 
 // ── API ─────────────────────────────────────────────────────────────────────
 API int eng_init() {
     if (cublasCreate(&g_blas)) return 1;
     if (cublasSetMathMode(g_blas, CUBLAS_TF32_TENSOR_OP_MATH)) return 2;
     if (cudaMalloc(&g_ws, 64 << 20)) return 3;
+#ifndef AXIS_HIP
+    // dedicated workspace makes cuBLAS legal inside CUDA-graph capture;
+    // hipBLAS manages its own workspace, so this is CUDA-only.
     if (cublasSetWorkspace(g_blas, g_ws, 64 << 20)) return 4;
+#endif
     if (cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking)) return 5;
     if (cublasSetStream(g_blas, g_stream)) return 6;    // flash kernels use >48KB dynamic shared memory — opt in here (NOT inside
     // graph capture)
+#ifdef AXIS_FLASH
     cudaFuncSetAttribute(k_flash_fwd<64, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
     cudaFuncSetAttribute(k_flash_fwd<32, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
     cudaFuncSetAttribute(k_flash_bwd<64, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
     cudaFuncSetAttribute(k_flash_bwd<32, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, 100 << 10);
+#endif
     for (int i = 0; i < MAX_BUFS; i++) g_bufs[i] = nullptr;
     return 0;
 }
@@ -769,6 +789,14 @@ API int eng_alloc(int idx, long long nelems, int elsize) {
     if (idx < 0 || idx >= MAX_BUFS) return 1;
     if (cudaMalloc(&g_bufs[idx], nelems * elsize)) return 2;
     return 0;
+}
+
+API int eng_has_flash() {
+#ifdef AXIS_FLASH
+    return 1;
+#else
+    return 0;      // HIP v1: use the tiled attention path
+#endif
 }
 
 // ── NCCL data parallel (built with -DAXIS_NCCL) ─────────────────────────
@@ -968,6 +996,7 @@ static int exec_op(const EngOp* op) {
         case OP_FLASH: {
             // a=q b=k d=v c=o; m=T n=DH k=KV batch=B tb=H; sa=lse buf (0=none);
             // alpha=scale. bf16 only; DH%16==0, DH<=128.
+#ifdef AXIS_FLASH
             if (op->dt != 1 || op->n % 16 || op->n > 128) return 101;
             int T_ = op->m, DH_ = op->n;
             float* lse = op->sa > 0 ? EL(float)(g_bufs[op->sa]) : nullptr;
@@ -983,6 +1012,9 @@ static int exec_op(const EngOp* op) {
                     T_, DH_, op->tb, op->k, op->alpha);
             }
             break;
+#else
+            return 105;   // flash not built on this backend (use attn_impl=tiled)
+#endif
         }
         case OP_CAST: {
             long long n = ((long long)op->m) * (op->n > 0 ? op->n : 1);
@@ -993,15 +1025,20 @@ static int exec_op(const EngOp* op) {
         }
         case OP_ROWDOT: {
             // c[r] = sum_d a[r,d]*b[r,d]; m=rows n=dim; bf16 in (dt>=1), fp32 out
+#ifdef AXIS_FLASH
             long long rows = op->m;
             int blocks = (int)((rows * 32 + 255) / 256);
             if (op->dt >= 1) k_rowdot<<<blocks, 256, 0, g_stream>>>(CEL(bf16)(A), CEL(bf16)(B), EL(float)(C), rows, op->n);
             else             k_rowdot<<<blocks, 256, 0, g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), rows, op->n);
             break;
+#else
+            return 105;
+#endif
         }
         case OP_FLASH_BWD: {
             // a=q b=k d=v c=dO; sa=lse sb=D tb=dqf sc=dkf oa=dvf ob=H;
             // m=T n=DH k=KV batch=B; alpha=scale. dq/dk/dv fp32 (pre-zeroed).
+#ifdef AXIS_FLASH
             if (op->dt != 1 || op->n % 16 || op->n > 128) return 102;
             int T_ = op->m, DH_ = op->n, Hh = op->ob;
             float* dqf = EL(float)(g_bufs[op->tb]);
@@ -1021,6 +1058,9 @@ static int exec_op(const EngOp* op) {
                     dqf, dkf, dvf, T_, DH_, Hh, op->k, op->alpha);
             }
             break;
+#else
+            return 105;
+#endif
         }
         case OP_ALLREDUCE:
             // a = fp32 buffer, n = element count; AVERAGES across ranks

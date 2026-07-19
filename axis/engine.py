@@ -18,7 +18,7 @@ import numpy as np
  GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL, REPEAT_KV,
  RMSNORM_BWD, COLSUM, REPEAT_KV_BWD, SOFTMAX_BWD, SILU_BWD,
  EMBED, EMBED_BWD, CE, TICK, CAST, FLASH, ROWDOT, FLASH_BWD,
- ALLREDUCE, GROUP) = range(28)
+ ALLREDUCE, GROUP, L2ACC, CLIPSCALE, COUNTVALID) = range(31)
 
 
 class _EngOp(ctypes.Structure):
@@ -53,10 +53,15 @@ def op(kind: int, a: int = -1, b: int = -1, c: int = -1, d: int = -1,
     RMSNORM_BWD: a=x b=w d=g -> c=dx, tb=tmp buffer (colsum -> dw)
     SILU_BWD: a=g b=u d=grad -> c=dg, tb=du buffer
     EMBED(_BWD): a=table|g, b=ids(fp32) -> c; m=N n=D (BWD: dt>=1 means g bf16)
-    CE: a=logits b=targets -> c=dlogits d=loss(fp32); m=N n=V
+    CE: a=logits b=targets -> c=dlogits d=loss(fp32); m=N n=V; sa=denom buf
+        (mean over valid tokens, 0->1/N); target<0 = ignored position
     ADAMW: a=master(fp32) b=g(fp32) c=m d=v; tb=t-buffer (-1 folded);
-           sa=bf16 param mirror (0 = none); alpha=lr beta=lr*wd gamma=eps
+           sa=bf16 param mirror (0 = none); sb=device-lr buf (0->alpha const);
+           oa=grad-scale buf (0->1); alpha=lr beta=wd(raw) gamma=eps
     CAST: a->c; tb=0 fp32->bf16, tb=1 bf16->fp32; m(*n)=count
+    L2ACC: a=fp32 grad -> c=sumsq acc (atomicAdd, zero c first); n=count
+    CLIPSCALE: a=sumsq acc -> c=scale (min(1, max_norm/(||g||+eps))); alpha=max_norm
+    COUNTVALID: a=targets(fp32,<0 ignore) -> c=count acc (zero first); m=N
     FLASH: fused attention fwd (bf16): a=q b=k d=v c=o; m=T n=DH k=KV
            batch=B tb=H; sa=lse buffer (0=none); alpha=scale
     ROWDOT: c[r] = sum_d a[r,d]*b[r,d]; m=rows n=dim; fp32 out

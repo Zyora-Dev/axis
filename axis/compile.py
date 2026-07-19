@@ -20,7 +20,8 @@ from axis.engine import (Engine, op, GEMM, ADD, RMSNORM, SILU_MUL, SCALE, COPY,
                          GEMM_SB, PERM_0213, ROPE, SOFTMAX_CAUSAL,
                          RMSNORM_BWD, COLSUM, SOFTMAX_BWD,
                          SILU_BWD, EMBED, EMBED_BWD, CE, ADAMW, TICK, CAST,
-                         FLASH, ROWDOT, FLASH_BWD, ALLREDUCE, GROUP)
+                         FLASH, ROWDOT, FLASH_BWD, ALLREDUCE, GROUP,
+                         L2ACC, CLIPSCALE, COUNTVALID)
 
 
 class CompiledTransformer:
@@ -31,7 +32,7 @@ class CompiledTransformer:
                  lora_r: int = 0, lora_alpha: float = 16.0,
                  lora_targets=("q_proj", "k_proj", "v_proj", "o_proj",
                                "gate_proj", "up_proj", "down_proj"),
-                 grad_sync: bool = False):
+                 grad_sync: bool = False, max_grad_norm: float = 0.0):
         # recompute_attn: kept for API compat — tiled attention always
         # recomputes probs per tile in backward (flash-style memory).
         # attn_impl: "auto" (fused flash kernel when eligible: bf16, head_dim
@@ -46,6 +47,7 @@ class CompiledTransformer:
         self.cfg = cfg
         self.B, self.T = batch, seq
         self.lr, self.wd = lr, wd
+        self.max_grad_norm = max_grad_norm
         self.dtype = dtype
         hf = dtype == "bf16"               # half storage
         DT = 1 if hf else 0                # per-op dt flag for storage ops
@@ -157,6 +159,11 @@ class CompiledTransformer:
         self.b_ids = A(N)
         self.b_tgt = A(N)
         self.b_loss = A(1)
+        self.b_denom = A(1)          # valid-token count for CE mean (ignore_index)
+        # device learning rate (schedulable under CUDA graphs) + grad-clip scalars
+        self.b_lr = eng.new_tensor(np.array([lr], dtype=np.float32))
+        self.b_gnorm = A(1)          # global grad sumsq accumulator
+        self.b_gscale = A(1)         # clip scale = min(1, max_norm/||g||)
 
         # ── per-block saved activations (dtype isz) ──
         # Attention is streaming (query-tiled) AND GQA-native:
@@ -317,7 +324,9 @@ class CompiledTransformer:
              if tied else
              op(GEMM_SB, a=xf, b=lm_w, c=logits, m=N, k=D, n=V, batch=1, dt=DT)),
             op(SCALE, a=self.b_loss, c=self.b_loss, n=1, alpha=0.0),
-            op(CE, a=logits, b=self.b_tgt, c=dlogits, d=self.b_loss, m=N, n=V, dt=DT),
+            op(SCALE, a=self.b_denom, c=self.b_denom, n=1, alpha=0.0),
+            op(COUNTVALID, a=self.b_tgt, c=self.b_denom, m=N),
+            op(CE, a=logits, b=self.b_tgt, c=dlogits, d=self.b_loss, sa=self.b_denom, m=N, n=V, dt=DT),
         ]
 
         # ── head backward ──
@@ -444,13 +453,28 @@ class CompiledTransformer:
                             + [op(GROUP, tb=1)])
         # device-side step counter — AdamW bias correction on device (graph-exact)
         self.b_t = eng.new_tensor(np.zeros(1, dtype=np.float32))
-        self.plan_step = (self.plan_fb + self.plan_ar
+        # global-norm gradient clipping (device, graph-safe): zero the accumulator,
+        # sum-of-squares over every trainable grad, then scale = min(1, mgn/||g||).
+        # Runs AFTER the allreduce so it clips the averaged (global) gradient.
+        self._clip = []
+        if max_grad_norm and max_grad_norm > 0:
+            self._clip = ([op(SCALE, a=self.b_gnorm, c=self.b_gnorm, n=1, alpha=0.0)]
+                          + [op(L2ACC, a=self.gbuf[nm], c=self.b_gnorm,
+                                n=int(np.prod(self.shapes[nm]))) for nm in self.pnames]
+                          + [op(CLIPSCALE, a=self.b_gnorm, c=self.b_gscale,
+                                alpha=max_grad_norm)])
+        # wd only on >=2D params (norms/biases excluded — standard LLM recipe)
+        self._wd = {nm: (self.wd if len(self.shapes[nm]) >= 2 else 0.0)
+                    for nm in self.pnames}
+        gsc = self.b_gscale if self._clip else 0
+        self.plan_step = (self.plan_fb + self.plan_ar + self._clip
                           + [op(TICK, a=self.b_t)]
                           + [op(ADAMW, a=self.master[nm], b=self.gbuf[nm],
                                 c=self._mb[nm], d=self._vb[nm], tb=self.b_t,
                                 sa=(self.pb[nm] if hf else 0),
+                                sb=self.b_lr, oa=gsc,
                                 n=int(np.prod(self.shapes[nm])),
-                                alpha=self.lr, beta=self.lr * self.wd, gamma=1e-8)
+                                alpha=self.lr, beta=self._wd[nm], gamma=1e-8)
                              for nm in self.pnames])
 
     def _adamw_ops(self, t: int):
@@ -459,12 +483,19 @@ class CompiledTransformer:
         bc2 = 1.0 - 0.95 ** t
         a_lr = self.lr * float(np.sqrt(bc2)) / bc1
         g_eps = 1e-8 * float(np.sqrt(bc2))
+        # host-folded bias correction (parity path); no device lr, no clip
         return [op(ADAMW, a=self.master[nm], b=self.gbuf[nm], c=self._mb[nm],
                    d=self._vb[nm], tb=-1, sa=(self.pb[nm] if hf else 0),
                    n=int(np.prod(self.shapes[nm])), alpha=a_lr,
-                   beta=self.lr * self.wd, gamma=g_eps) for nm in self.pnames]
+                   beta=self._wd[nm], gamma=g_eps) for nm in self.pnames]
 
     # ── API ──
+    def set_lr(self, lr: float) -> None:
+        """Update the learning rate for subsequent steps (works under CUDA
+        graph replay — lr lives in a device buffer). Pair with any schedule."""
+        self.lr = float(lr)
+        self.eng.upload(self.b_lr, np.array([lr], dtype=np.float32))
+
     def step(self, tokens: np.ndarray, targets: np.ndarray, t: int = None) -> float:
         self.eng.upload(self.b_ids, tokens.reshape(-1).astype(np.float32))
         self.eng.upload(self.b_tgt, targets.reshape(-1).astype(np.float32))
@@ -496,12 +527,42 @@ class CompiledTransformer:
         return {nm: self.eng.download(self.master[nm], self.shapes[nm])
                 for nm in self.pnames}
 
+    def state_dict(self) -> Dict[str, np.ndarray]:
+        """Full resumable training state: trainable weights + AdamW moments +
+        step counter + lr. `load_state_dict` restores it exactly."""
+        st = {}
+        for nm in self.pnames:
+            sh = self.shapes[nm]
+            st[f"w/{nm}"] = self.eng.download(self.master[nm], sh)
+            st[f"m/{nm}"] = self.eng.download(self._mb[nm], sh)
+            st[f"v/{nm}"] = self.eng.download(self._vb[nm], sh)
+        st["_t"] = self.eng.download(self.b_t, (1,))
+        st["_lr"] = np.array([self.lr], dtype=np.float32)
+        return st
+
+    def load_state_dict(self, st: Dict[str, np.ndarray]) -> None:
+        """Restore weights + optimizer moments + step counter + lr. Refreshes
+        the bf16 mirrors so the compute view matches the restored masters."""
+        hf = self.dtype == "bf16"
+        refresh = []
+        for nm in self.pnames:
+            self.eng.upload(self.master[nm], st[f"w/{nm}"].reshape(-1))
+            self.eng.upload(self._mb[nm], st[f"m/{nm}"].reshape(-1))
+            self.eng.upload(self._vb[nm], st[f"v/{nm}"].reshape(-1))
+            if hf:
+                refresh.append(op(CAST, a=self.master[nm], c=self.pb[nm],
+                                  m=int(np.prod(self.shapes[nm])), tb=0))
+        if refresh:
+            self.eng.run(refresh)
+        self.eng.upload(self.b_t, np.asarray(st["_t"], dtype=np.float32).reshape(-1))
+        self.set_lr(float(np.asarray(st["_lr"]).reshape(-1)[0]))
+
 
 def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
                   recompute_attn: bool = True, dtype: str = "fp32",
                   attn_tile: int = 256, attn_impl: str = "auto",
-                  grad_sync: bool = False) -> CompiledTransformer:
+                  grad_sync: bool = False, max_grad_norm: float = 0.0) -> CompiledTransformer:
     """Compile an axis.nn.Transformer instance into a native training step.
 
         ct = axis.compile_model(model, batch=8, seq=2048, dtype="bf16")
@@ -538,4 +599,4 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
                                lora_r=lora_r, lora_alpha=lora_alpha,
                                lora_targets=targets or ("q_proj", "k_proj",
                                                         "v_proj", "o_proj"),
-                               grad_sync=grad_sync)
+                               grad_sync=grad_sync, max_grad_norm=max_grad_norm)

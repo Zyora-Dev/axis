@@ -55,8 +55,10 @@ class AdamW:
             m_hat = self._m[i] / bc1
             v_hat = self._v[i] / bc2
             target = self._master[i] if self._master[i] is not None else p.data
-            # Decoupled weight decay (applied directly to weights).
-            if self.weight_decay > 0.0:
+            # Decoupled weight decay — applied only to >=2D params (matmuls +
+            # embeddings). 1D tensors (norms, biases) are excluded, matching the
+            # standard LLM recipe (nanoGPT/GPT-3/Llama).
+            if self.weight_decay > 0.0 and p.data.ndim >= 2:
                 target *= (1.0 - self.lr * self.weight_decay)
             target -= self.lr * m_hat / (array_module(v_hat).sqrt(v_hat) + self.eps)
             if self._master[i] is not None:

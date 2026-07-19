@@ -39,7 +39,8 @@ enum OpKind {
     OP_COLSUM = 14, OP_REPEAT_KV_BWD = 15, OP_SOFTMAX_BWD = 16, OP_SILU_BWD = 17,
     OP_EMBED = 18, OP_EMBED_BWD = 19, OP_CE = 20, OP_TICK = 21, OP_CAST = 22,
     OP_FLASH = 23, OP_ROWDOT = 24, OP_FLASH_BWD = 25,
-    OP_ALLREDUCE = 26, OP_GROUP = 27,
+    OP_ALLREDUCE = 26, OP_GROUP = 27, OP_L2ACC = 28, OP_CLIPSCALE = 29,
+    OP_COUNTVALID = 30,
 };
 
 typedef struct {
@@ -120,30 +121,58 @@ __global__ void k_rmsnorm(const T* x, const T* w, T* o, int rows, int dim, float
 }
 // AdamW. tbuf: device step counter (bias correction on device — graph-exact).
 // pbf: optional bf16 param mirror (master p stays fp32; pbf gets the cast).
+// lrbuf: optional device learning rate (LR schedule under graphs); if null,
+// falls back to the alpha constant. gsbuf: optional device grad-scale (global
+// grad clipping); if null, 1. beta is the RAW weight decay (kernel multiplies
+// by the effective lr) — decoupled AdamW.
 __global__ void k_adamw(float* p, const float* g, float* m, float* v,
                         const float* tbuf, bf16* pbf,
+                        const float* lrbuf, const float* gsbuf,
                         float alpha, float beta, float gamma, int n) {
     const float b1 = 0.9f, b2 = 0.95f;
-    __shared__ float s_alpha, s_gamma;
+    __shared__ float s_alpha, s_gamma, s_wd, s_gs;
     if (threadIdx.x == 0) {
+        float lr = lrbuf ? lrbuf[0] : alpha;
+        s_gs = gsbuf ? gsbuf[0] : 1.f;
         if (tbuf) {
             float t = tbuf[0];
             float bc1 = 1.f - powf(b1, t);
             float bc2 = 1.f - powf(b2, t);
-            s_alpha = alpha * sqrtf(bc2) / bc1;
+            s_alpha = lr * sqrtf(bc2) / bc1;
             s_gamma = gamma * sqrtf(bc2);
-        } else { s_alpha = alpha; s_gamma = gamma; }
+        } else { s_alpha = lr; s_gamma = gamma; }
+        s_wd = lr * beta;                 // effective decoupled decay
     }
     __syncthreads();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float gi = g[i];
+    float gi = g[i] * s_gs;
     float mi = b1 * m[i] + (1.f - b1) * gi;
     float vi = b2 * v[i] + (1.f - b2) * gi * gi;
     m[i] = mi; v[i] = vi;
-    float pi = p[i] * (1.f - beta) - s_alpha * mi / (sqrtf(vi) + s_gamma);
+    float pi = p[i] * (1.f - s_wd) - s_alpha * mi / (sqrtf(vi) + s_gamma);
     p[i] = pi;
     if (pbf) pbf[i] = __float2bfloat16(pi);
+}
+// global-grad-norm helpers (fp32 grads). L2ACC: sumsq of a buffer -> acc[0]
+// (atomicAdd; caller zeroes acc first). CLIPSCALE: acc[0]=sumsq ->
+// scale[0]=min(1, max_norm/(sqrt(sumsq)+eps)).
+__global__ void k_l2acc(const float* g, float* acc, int n) {
+    extern __shared__ float sh[];
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += blockDim.x * gridDim.x) s += g[i] * g[i];
+    sh[threadIdx.x] = s; __syncthreads();
+    for (int d = blockDim.x / 2; d > 0; d >>= 1) {
+        if (threadIdx.x < d) sh[threadIdx.x] += sh[threadIdx.x + d];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(acc, sh[0]);
+}
+__global__ void k_clipscale(const float* acc, float* scale, float max_norm) {
+    if (threadIdx.x || blockIdx.x) return;
+    float nrm = sqrtf(acc[0]);
+    scale[0] = (max_norm > 0.f && nrm > max_norm) ? max_norm / (nrm + 1e-6f) : 1.f;
 }
 __global__ void k_tick(float* t) { if (threadIdx.x == 0 && blockIdx.x == 0) t[0] += 1.f; }
 
@@ -340,13 +369,33 @@ __global__ void k_embed_bwd(const T* g, const float* ids, float* dT, int N, int 
     int r = (int)(i / D), j = (int)(i % D);
     atomicAdd(&dT[(long long)((int)ids[r]) * D + j], ldf(g, i));
 }
+// count of valid (non-ignored) targets -> acc[0]. tgt < 0 means ignore.
+__global__ void k_countvalid(const float* tgt, float* acc, int N) {
+    extern __shared__ float sh[];
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
+         i += blockDim.x * gridDim.x) s += (tgt[i] >= 0.f) ? 1.f : 0.f;
+    sh[threadIdx.x] = s; __syncthreads();
+    for (int d = blockDim.x / 2; d > 0; d >>= 1) {
+        if (threadIdx.x < d) sh[threadIdx.x] += sh[threadIdx.x + d];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(acc, sh[0]);
+}
 template <typename T>
 __global__ void k_ce(const T* logits, const float* tgt, T* dlogits,
-                     float* loss, int N, int V) {
+                     float* loss, const float* denom, int N, int V) {
     int r = blockIdx.x;
     if (r >= N) return;
     extern __shared__ float sh[];
     const T* lr = logits + (long long)r * V;
+    int t = (int)tgt[r];
+    // ignored row (target < 0): zero its dlogits, contribute nothing to loss
+    if (t < 0) {
+        for (int j = threadIdx.x; j < V; j += blockDim.x)
+            stf(dlogits, (long long)r * V + j, 0.f);
+        return;
+    }
     float mx = -1e30f;
     for (int j = threadIdx.x; j < V; j += blockDim.x) mx = fmaxf(mx, ldf(lr, j));
     sh[threadIdx.x] = mx; __syncthreads();
@@ -363,8 +412,7 @@ __global__ void k_ce(const T* logits, const float* tgt, T* dlogits,
         __syncthreads();
     }
     se = sh[0];
-    int t = (int)tgt[r];
-    float inv = 1.f / N;
+    float inv = denom ? (1.f / denom[0]) : (1.f / N);   // mean over VALID tokens
     for (int j = threadIdx.x; j < V; j += blockDim.x) {
         float p = expf(ldf(lr, j) - mx) / se;
         stf(dlogits, (long long)r * V + j, (p - (j == t ? 1.f : 0.f)) * inv);
@@ -900,8 +948,10 @@ static int exec_op(const EngOp* op) {
         case OP_ADAMW: {
             const float* tb_ptr = op->tb >= 0 ? CEL(float)(g_bufs[op->tb]) : nullptr;
             bf16* pbf = op->sa > 0 ? EL(bf16)(g_bufs[op->sa]) : nullptr;   // sa = bf16 mirror
+            const float* lrb = op->sb > 0 ? CEL(float)(g_bufs[op->sb]) : nullptr;  // device lr
+            const float* gsb = op->oa > 0 ? CEL(float)(g_bufs[op->oa]) : nullptr;  // grad scale
             k_adamw<<<(op->n + T - 1) / T, T, 0, g_stream>>>(EL(float)(A), CEL(float)(B), EL(float)(C), EL(float)(D),
-                                                             tb_ptr, pbf, op->alpha, op->beta, op->gamma, op->n);
+                                                             tb_ptr, pbf, lrb, gsb, op->alpha, op->beta, op->gamma, op->n);
             break;
         }
         case OP_SCALE:
@@ -987,8 +1037,12 @@ static int exec_op(const EngOp* op) {
             break;
         }
         case OP_CE:
-            if (h) k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(float)(B), EL(bf16)(C), EL(float)(D), op->m, op->n);
-            else   k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), EL(float)(D), op->m, op->n);
+            // sa = optional denom buffer (mean over valid tokens; 0 -> 1/N)
+            {
+            const float* den = op->sa > 0 ? CEL(float)(g_bufs[op->sa]) : nullptr;
+            if (h) k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(bf16)(A), CEL(float)(B), EL(bf16)(C), EL(float)(D), den, op->m, op->n);
+            else   k_ce<<<op->m, T, T * sizeof(float), g_stream>>>(CEL(float)(A), CEL(float)(B), EL(float)(C), EL(float)(D), den, op->m, op->n);
+            }
             break;
         case OP_TICK:
             k_tick<<<1, 1, 0, g_stream>>>(EL(float)(A));
@@ -1061,6 +1115,22 @@ static int exec_op(const EngOp* op) {
 #else
             return 105;
 #endif
+        }
+        case OP_L2ACC: {
+            // a = fp32 grad buffer, c = acc scalar; n = count. atomicAdd sumsq.
+            int blocks = (op->n + 255) / 256; if (blocks > 1024) blocks = 1024;
+            k_l2acc<<<blocks, 256, 256 * sizeof(float), g_stream>>>(CEL(float)(A), EL(float)(C), op->n);
+            break;
+        }
+        case OP_CLIPSCALE:
+            // a = sumsq acc, c = scale out; alpha = max_norm
+            k_clipscale<<<1, 1, 0, g_stream>>>(CEL(float)(A), EL(float)(C), op->alpha);
+            break;
+        case OP_COUNTVALID: {
+            // a = targets (fp32, <0 = ignore), c = count acc; m = N
+            int blocks = (op->m + 255) / 256; if (blocks > 1024) blocks = 1024;
+            k_countvalid<<<blocks, 256, 256 * sizeof(float), g_stream>>>(CEL(float)(A), EL(float)(C), op->m);
+            break;
         }
         case OP_ALLREDUCE:
             // a = fp32 buffer, n = element count; AVERAGES across ranks

@@ -38,12 +38,20 @@ Made in India. Proprietary framework, © Zyora Labs.
 ## Install
 
 ```bash
-pip install -e .
-
-# Build the CUDA runtime (once, on a machine with nvcc):
-nvcc -O3 -arch=sm_80 --shared -Xcompiler -fPIC \
-     engine/runtime.cu -lcublas -o libaxeng.so
+pip install axis-zyora           # add [gpu] for multi-GPU (NCCL): pip install "axis-zyora[gpu]"
 ```
+
+The CUDA engine is compiled from source on first use with your local `nvcc`
+(GPU architecture auto-detected, result cached under `~/.cache/axis-zyora`), so
+a fresh install just works on a CUDA box. You can also build it explicitly:
+
+```bash
+axis-zyora check                 # report GPU / nvcc / engine status
+axis-zyora build                 # compile the engine now (--arch sm_90, --nccl, --force)
+```
+
+Point at a prebuilt `.so` instead with `AXIS_ENGINE_LIB=/path/to/libaxeng.so`,
+or override the arch with `AXIS_ARCH=sm_90`.
 
 ## Quickstart — train on the compiled engine
 
@@ -127,8 +135,8 @@ ct = axis.compile_model(model, batch=4, seq=2048, dtype="bf16",
 Build the runtime with NCCL for multi-GPU:
 
 ```bash
-nvcc -O3 -arch=sm_80 --shared -Xcompiler -fPIC -DAXIS_NCCL \
-     -I$NCCL/include engine/runtime.cu -L$NCCL/lib -lnccl -lcublas -o libaxeng.so
+pip install "axis-zyora[gpu]"     # pulls the NCCL dependency
+axis-zyora build --nccl           # rebuild the engine with NCCL collectives
 ```
 
 ## Benchmarks
@@ -183,7 +191,7 @@ Every capability is gated against a reference implementation before it ships:
 |---|---|
 | `axis.compile` | `compile_model` / `CompiledTransformer` — lowers the full training step to the CUDA engine; bf16, flash attention, CUDA graphs, LoRA, DDP, ZeRO-1 |
 | `axis.engine` | ctypes binding to the C ABI runtime (execution plans, graph capture, NCCL) |
-| `engine/runtime.cu` | C++/CUDA runtime — own cuBLAS handle, fused kernels, WMMA flash attention (fwd+bwd), AdamW, NCCL collectives |
+| `axis/_csrc/runtime.cu` | C++/CUDA runtime — own cuBLAS handle, fused kernels, WMMA flash attention (fwd+bwd), AdamW, NCCL collectives |
 | `axis.nn` | `Transformer`, RoPE, RMSNorm, SwiGLU, grouped-query attention |
 | `axis.pretrained` | `from_pretrained` — HuggingFace safetensors loader |
 | `axis.tokenizer` | `HFTokenizer` — byte-level BPE (GPT-2 / Llama-3 / Qwen / Mistral) |

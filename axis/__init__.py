@@ -19,7 +19,7 @@ from axis.tokenizer import HFTokenizer
 from axis.compile import compile_model, CompiledTransformer
 from axis._build import build_engine, engine_lib
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",

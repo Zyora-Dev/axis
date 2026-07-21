@@ -16,8 +16,10 @@ from axis.data import ByteTokenizer, LMDataset, DataLoader
 from axis import lora
 from axis.generate import generate
 from axis.tokenizer import HFTokenizer
+from axis.compile import compile_model, CompiledTransformer
+from axis._build import build_engine, engine_lib
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 __all__ = [
     "Tensor", "tensor", "zeros", "ones", "randn", "arange",
@@ -28,5 +30,6 @@ __all__ = [
     "ByteTokenizer", "LMDataset", "DataLoader",
     "lora", "generate",
     "HFTokenizer",
+    "compile_model", "CompiledTransformer", "build_engine", "engine_lib",
     "__version__",
 ]

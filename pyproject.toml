@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "axis-ml"
-version = "0.14.0"
+name = "axis-zyora"
+version = "0.15.0"
 description = "Axis — India's first proprietary AI training & fine-tuning framework, by Zyora Labs"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,10 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 hf = ["regex"]  # real HuggingFace byte-level BPE tokenizer (axis.tokenizer)
+gpu = ["nvidia-nccl-cu12"]  # multi-GPU (NCCL); the engine itself builds via nvcc
+
+[project.scripts]
+axis-zyora = "axis.cli:main"
 
 [project.urls]
 Homepage = "https://zyoralabs.com"
@@ -27,6 +31,9 @@ Repository = "https://github.com/Zyora-Dev/axis"
 
 [tool.setuptools.packages.find]
 include = ["axis*"]
+
+[tool.setuptools.package-data]
+axis = ["_csrc/*.cu", "_csrc/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

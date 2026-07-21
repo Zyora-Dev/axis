@@ -12,7 +12,7 @@ REPO = HERE.parent
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
     .pip_install("numpy>=1.24", "torch")
-    .add_local_file(str(HERE / "runtime.cu"), remote_path="/root/runtime.cu")
+    .add_local_file(str(REPO / "axis" / "_csrc" / "runtime.cu"), remote_path="/root/runtime.cu")
     .add_local_dir(str(REPO / "axis"), remote_path="/root/axis")
 )
 app = modal.App("axis-engine-compile")

@@ -615,7 +615,7 @@ class CompiledTransformer:
         self.set_lr(float(np.asarray(st["_lr"]).reshape(-1)[0]))
 
 
-def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
+def compile_model(model, batch: int, seq: int, lib_path: str = None,
                   lr: float = 3e-4, wd: float = 0.1, tf32: bool = True,
                   recompute_attn: bool = True, dtype: str = "fp32",
                   attn_tile: int = 256, attn_impl: str = "auto",
@@ -630,6 +630,9 @@ def compile_model(model, batch: int, seq: int, lib_path: str = "libaxeng.so",
     LoRA models (axis.lora.apply_lora) are detected automatically: base
     weights compile as frozen, only the adapters train.
     """
+    if lib_path is None:                 # build/resolve the CUDA engine on demand
+        from axis._build import engine_lib
+        lib_path = engine_lib(nccl=grad_sync)
     blk = model.blocks[0]
     # normalize LoRA wrapping: "...q_proj.base.weight" -> "...q_proj.weight"
     weights = {n.replace(".base.weight", ".weight"): p.data

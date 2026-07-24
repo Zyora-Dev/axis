@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Axis vs PyTorch — 7B LoRA Benchmark · Zyora Labs</title>
+<style>
+  :root{
+    --bg:#080b08; --panel:#0e130d; --line:rgba(255,255,255,.12);
+    --fg:#eef3ec; --dim:#aeb6ab;
+    --axis:#a3e635; --axis2:#4d7c0f;
+    --torch:#f97316; --torch2:#7c2d12;
+    --good:#a3e635;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:radial-gradient(1200px 600px at 50% -10%,rgba(163,230,53,.08),transparent 60%),var(--bg);
+    color:var(--fg);
+    font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial;
+    -webkit-font-smoothing:antialiased;
+    padding:40px 20px 80px;
+    print-color-adjust:exact;-webkit-print-color-adjust:exact;
+  }
+  .wrap{max-width:960px;margin:0 auto}
+  .eyebrow{display:inline-flex;gap:8px;align-items:center;font-size:12px;font-weight:600;
+    color:var(--axis);border:1px solid rgba(163,230,53,.3);background:rgba(163,230,53,.06);
+    padding:6px 12px;border-radius:999px}
+  h1{font-size:clamp(28px,5vw,44px);letter-spacing:-.02em;margin:18px 0 6px;font-weight:700}
+  h1 .g{background:linear-gradient(90deg,#a3e635,#65a30d);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--dim);max-width:620px;font-size:16px}
+  .config{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+  .chip{font-size:12px;color:var(--fg);background:rgba(255,255,255,.05);border:1px solid var(--line);
+    padding:5px 11px;border-radius:8px}
+  .chip b{color:var(--axis);font-weight:600}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:26px;margin-top:26px}
+
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+  .tab{cursor:pointer;border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--fg);
+    padding:9px 16px;border-radius:999px;font-size:14px;font-weight:600;transition:.18s}
+  .tab:hover{border-color:rgba(163,230,53,.5)}
+  .tab.on{background:var(--axis);color:#0a0f04;border-color:var(--axis)}
+  .hint{font-size:12.5px;color:var(--dim);margin:6px 2px 22px}
+
+  .row{display:grid;grid-template-columns:120px 1fr;align-items:center;gap:14px;margin:16px 0}
+  .lab{display:flex;align-items:center;gap:9px;font-weight:600}
+  .dot{width:11px;height:11px;border-radius:3px}
+  .track{position:relative;height:44px;background:rgba(255,255,255,.04);border:1px solid var(--line);
+    border-radius:12px;overflow:hidden}
+  .bar{position:absolute;inset:0 auto 0 0;width:0;border-radius:11px;transition:width .7s cubic-bezier(.22,1,.36,1);
+    display:flex;align-items:center;justify-content:flex-end;padding-right:14px}
+  .bar.axis{background:linear-gradient(90deg,var(--axis2),var(--axis))}
+  .bar.torch{background:linear-gradient(90deg,var(--torch2),var(--torch))}
+  .val{font-variant-numeric:tabular-nums;font-weight:700;color:#0a0f04;font-size:15px;white-space:nowrap}
+  .win{margin-left:10px;font-size:11px;font-weight:700;color:var(--good);
+    border:1px solid rgba(163,230,53,.4);background:rgba(163,230,53,.08);padding:2px 8px;border-radius:999px;
+    opacity:0;transition:.3s}
+  .win.show{opacity:1}
+  .better{float:right;font-size:12px;color:var(--dim);font-weight:500}
+
+  table{width:100%;border-collapse:separate;border-spacing:0;font-size:14px;margin-top:6px}
+  th,td{padding:12px 14px;text-align:right;border-bottom:1px solid rgba(255,255,255,.07)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--dim);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+  td.hi{color:var(--axis);font-weight:700}
+  .name{font-weight:600}
+  .verdict{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:26px}
+  .v{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px}
+  .v .n{font-size:30px;font-weight:800;letter-spacing:-.02em;
+    background:linear-gradient(90deg,#a3e635,#65a30d);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .v .d{color:var(--dim);font-size:13px;margin-top:4px}
+  .notes{margin-top:26px;color:var(--fg)}
+  .notes h3{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--axis);margin:0 0 10px}
+  .notes li{margin:7px 0;color:#cfd6c9}
+  .foot{margin-top:34px;color:var(--dim);font-size:12.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  .printbtn{position:fixed;top:20px;right:20px;z-index:99;cursor:pointer;
+    display:inline-flex;align-items:center;gap:8px;font:600 14px/1 ui-sans-serif,system-ui,-apple-system;
+    color:#0a0f04;background:linear-gradient(90deg,#a3e635,#65a30d);border:none;
+    padding:11px 18px;border-radius:999px;box-shadow:0 10px 30px -10px rgba(163,230,53,.6);transition:.18s}
+  .printbtn:hover{transform:translateY(-1px);box-shadow:0 14px 34px -10px rgba(163,230,53,.75)}
+  .printbtn svg{width:16px;height:16px}
+  @media(max-width:640px){.row{grid-template-columns:1fr;gap:6px}.verdict{grid-template-columns:1fr}}
+  @media print{
+    @page{margin:14mm;size:A4}
+    body{padding:0;background:var(--bg)}
+    .bar{transition:none}
+    .printbtn{display:none!important}
+    .card,.v{break-inside:avoid}
+    .verdict{break-inside:avoid}
+    .notes{break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+<button class="printbtn" onclick="window.print()" title="Save this report as a PDF">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+  Print / Save as PDF
+</button>
+<div class="wrap">
+  <span class="eyebrow">● Reproducible benchmark · A100-80GB</span>
+  <h1>Axis vs PyTorch — <span class="g">7B LoRA fine-tuning</span></h1>
+  <p class="sub">Same model shape, same adapters, same GPU. Full-model 7B training doesn't fit
+  on a single 80&nbsp;GB GPU for either framework, so the single-GPU 7B benchmark is LoRA fine-tuning.</p>
+
+  <div class="config">
+    <span class="chip">Model <b>Llama-2-7B shape</b> · dim4096 · 32L · 32h · mlp11008 · V32000</span>
+    <span class="chip">LoRA <b>r=16</b> · q,k,v,o,gate,up,down · ~40M trainable</span>
+    <span class="chip">seq <b>2048</b> · batch <b>1</b> · <b>bf16</b></span>
+    <span class="chip">GPU <b>A100-80GB</b> · fresh container · 5 timed steps</span>
+  </div>
+
+  <div class="card">
+    <div class="tabs">
+      <div class="tab on" data-m="tps">Throughput</div>
+      <div class="tab" data-m="ms">Latency</div>
+      <div class="tab" data-m="mem">GPU memory</div>
+    </div>
+    <div class="hint" id="hint"></div>
+
+    <div class="row">
+      <div class="lab"><span class="dot" style="background:var(--axis)"></span>Axis</div>
+      <div class="track"><div class="bar axis" id="bAxis"><span class="val" id="vAxis"></span><span class="win" id="wAxis">best</span></div></div>
+    </div>
+    <div class="row">
+      <div class="lab"><span class="dot" style="background:var(--torch)"></span>PyTorch</div>
+      <div class="track"><div class="bar torch" id="bTorch"><span class="val" id="vTorch"></span><span class="win" id="wTorch">best</span></div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Framework</th><th>ms / step</th><th>tokens / s</th><th>GPU memory</th><th>Trainable</th></tr></thead>
+      <tbody>
+        <tr><td class="name">PyTorch (HF + PEFT + SDPA)</td><td>466</td><td>4,398</td><td>28.2 GB</td><td>40M</td></tr>
+        <tr><td class="name">Axis</td><td>534</td><td>3,833</td><td class="hi">23.3 GB</td><td>40M</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="verdict">
+    <div class="v"><div class="n">−17%</div><div class="d">GPU memory vs PyTorch (4.9&nbsp;GB saved)</div></div>
+    <div class="v"><div class="n">0.87×</div><div class="d">Throughput vs PyTorch (466 vs 534 ms/step)</div></div>
+    <div class="v"><div class="n">40M</div><div class="d">Identical adapters trained by both</div></div>
+  </div>
+
+  <div class="notes card">
+    <h3>Reading the results honestly</h3>
+    <ul>
+      <li><b>Axis's win is memory.</b> The frozen 7B base carries no optimizer state and stays in bf16, so Axis fine-tunes in <b>17% less GPU memory</b> (23.3&nbsp;GB vs 28.2&nbsp;GB) — headroom for longer context or larger batches on the same card.</li>
+      <li><b>PyTorch is faster here (~15%).</b> A decade of hand-tuned CUDA kernels and PEFT integration is ahead on raw LoRA throughput at 7B. We publish that, not just the wins.</li>
+      <li><b>Apples-to-apples.</b> Both train the same ~40M adapters on the same 7 projections (r=16), same Llama-2-7B shape, same bf16 + flash attention, each in its own fresh container.</li>
+      <li><b>Full-model 7B training</b> needs ~112&nbsp;GB for bf16 weights + grads + fp32 AdamW state — it doesn't fit on one 80&nbsp;GB GPU for either framework; that's a multi-GPU (ZeRO / FSDP) benchmark, run separately.</li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    <span>Axis · axis-zyora · github.com/Zyora-Dev/axis</span>
+    <span>Reproduce: <code>modal run engine/modal_7b_bench.py</code></span>
+    <span>© Zyora Labs · Made in India</span>
+  </div>
+</div>
+
+<script>
+  const DATA = {
+    tps: {axis:3833, torch:4398, unit:" tok/s", better:"higher", lowerWins:false, fmt:v=>v.toLocaleString()},
+    ms:  {axis:534,  torch:466,  unit:" ms",    better:"lower",  lowerWins:true,  fmt:v=>v.toLocaleString()},
+    mem: {axis:23.3, torch:28.2, unit:" GB",    better:"lower",  lowerWins:true,  fmt:v=>v.toFixed(1)}
+  };
+  const els = {
+    bAxis:document.getElementById('bAxis'), bTorch:document.getElementById('bTorch'),
+    vAxis:document.getElementById('vAxis'), vTorch:document.getElementById('vTorch'),
+    wAxis:document.getElementById('wAxis'), wTorch:document.getElementById('wTorch'),
+    hint:document.getElementById('hint')
+  };
+  function render(m){
+    const d = DATA[m];
+    const max = Math.max(d.axis, d.torch);
+    const scale = v => Math.max(14, (v/max)*100);        // % width, min so label fits
+    els.bAxis.style.width = scale(d.axis) + '%';
+    els.bTorch.style.width = scale(d.torch) + '%';
+    els.vAxis.textContent = d.fmt(d.axis) + d.unit;
+    els.vTorch.textContent = d.fmt(d.torch) + d.unit;
+    const axisWins = d.lowerWins ? d.axis < d.torch : d.axis > d.torch;
+    els.wAxis.classList.toggle('show', axisWins);
+    els.wTorch.classList.toggle('show', !axisWins);
+    els.hint.innerHTML = (d.better==="lower"?"Lower is better":"Higher is better")
+      + " — bar length scaled to the larger value.";
+  }
+  document.querySelectorAll('.tab').forEach(t=>{
+    t.onclick = ()=>{
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+      t.classList.add('on');
+      render(t.dataset.m);
+    };
+  });
+  render('tps');
+</script>
+</body>
+</html>
